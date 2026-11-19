@@ -654,3 +654,21 @@ func TestMergeExtraSpecs(t *testing.T) {
 		})
 	}
 }
+
+func TestCapacityExtraSpecs(t *testing.T) {
+	raw := []byte(`{"spot": true, "on_demand_fallback": false, "fallback_subnet_ids": ["subnet-bbbbbbbb"], "fallback_flavors": ["m7a.large"]}`)
+	require.NoError(t, jsonSchemaValidation(raw))
+	es := &extraSpecs{}
+	require.NoError(t, json.Unmarshal(raw, es))
+	r := &RunnerSpec{}
+	r.MergeExtraSpecs(es)
+	require.True(t, r.Spot)
+	require.True(t, r.SpotOnly)
+	require.Equal(t, []string{"subnet-bbbbbbbb"}, r.FallbackSubnets)
+	require.Equal(t, []string{"m7a.large"}, r.FallbackFlavors)
+
+	plain := &RunnerSpec{}
+	plain.MergeExtraSpecs(&extraSpecs{})
+	require.False(t, plain.Spot)
+	require.False(t, plain.SpotOnly)
+}
