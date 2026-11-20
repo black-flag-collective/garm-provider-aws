@@ -77,6 +77,7 @@ func newExtraSpecsFromBootstrapData(data params.BootstrapInstance) (*extraSpecs,
 }
 
 type extraSpecs struct {
+	EarlyBootstrap     bool             `json:"early_bootstrap,omitempty" jsonschema:"description=Use the preinstalled Black Flag early bootstrap helper."`
 	SubnetID           *string          `json:"subnet_id,omitempty" jsonschema:"pattern=^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$,description=The ID of the subnet formatted as subnet-xxxxxxxxxxxxxxxxx."`
 	SSHKeyName         *string          `json:"ssh_key_name,omitempty" jsonschema:"description=The name of the Key Pair to use for the instance."`
 	IAMInstanceProfile *string          `json:"iam_instance_profile,omitempty" jsonschema:"description=The IAM instance profile to associate with the instance."`
@@ -327,7 +328,7 @@ func (r *RunnerSpec) ComposeUserData() (string, error) {
 	var udata []byte
 	switch bootstrapParams.OSType {
 	case params.Linux:
-		cloudCfg, err := cloudconfig.GetCloudConfig(bootstrapParams, r.Tools, bootstrapParams.Name)
+		cloudCfg, err := linuxCloudConfig(bootstrapParams, r.Tools)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate userdata: %w", err)
 		}
