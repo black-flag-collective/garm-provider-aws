@@ -674,6 +674,10 @@ func TestCapacityExtraSpecs(t *testing.T) {
 }
 
 func TestFallbackSubnetValidation(t *testing.T) {
+	property, ok := generateJSONSchema().Definitions["extraSpecs"].Properties.Get("fallback_subnet_ids")
+	require.True(t, ok)
+	require.NotNil(t, property.Items)
+	require.Equal(t, "^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$", property.Items.Pattern)
 	for _, value := range []string{`{"fallback_subnet_ids":["subnet-12345678","subnet-0123456789abcdef0"]}`, `{"fallback_subnet_ids":[]}`} {
 		require.NoError(t, jsonSchemaValidation([]byte(value)))
 	}

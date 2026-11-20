@@ -26,7 +26,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v0\.1\.6-bfd\.[0-9]+$ ]]
-          mkdir -p release
+          mkdir -p build release
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -mod=vendor -trimpath \
               -ldflags "-s -w -X github.com/cloudbase/garm-provider-aws/provider.Version=$VERSION" \
