@@ -76,8 +76,20 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 			return "", fmt.Errorf("read runner claim: %w", err)
 		}
 	}
+	if claim.Cold != nil {
+		return a.createColdInstance(ctx, s, userData, record, &claim)
+	}
+	id, err := a.findStopped(ctx, s, cli, decoded, claimDir, record, &claim)
+	if id != "" || err != nil {
+		return id, err
+	}
+	// Keep the runner lock through fallback and persist its request/result too.
+	return a.createColdInstance(ctx, s, userData, record, &claim)
+}
+
+func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, claimDir string, record *os.File, claim *runnerClaim) (string, error) {
 	if claim.ID != "" {
-		return a.resumeStopped(ctx, s, cli, decoded, claimDir, record, &claim)
+		return a.resumeStopped(ctx, s, cli, decoded, claimDir, record, claim)
 	}
 	response, err := a.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
 		{Name: aws.String("tag:GARM_CONTROLLER_ID"), Values: []string{s.ControllerID}},
@@ -101,14 +113,14 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 			}
 			// Persist the selected instance before reserving it. No EC2 mutation can
 			// happen without this runner's recovery record already on disk.
-			claim = runnerClaim{ID: id}
-			if err := saveRunnerClaim(record, claim); err != nil {
+			*claim = runnerClaim{ID: id}
+			if err := saveRunnerClaim(record, *claim); err != nil {
 				return "", err
 			}
 			lease, err := reserveStopped(claimDir, id, s.BootstrapParams.Name)
 			if os.IsExist(err) {
-				claim = runnerClaim{}
-				if err := saveRunnerClaim(record, claim); err != nil {
+				*claim = runnerClaim{}
+				if err := saveRunnerClaim(record, *claim); err != nil {
 					return "", err
 				}
 				continue
@@ -117,7 +129,7 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 				return "", err
 			}
 			defer lease.Close()
-			return a.startClaimed(ctx, s, cli, decoded, record, &claim)
+			return a.startClaimed(ctx, s, cli, decoded, record, claim)
 
 		}
 	}
@@ -127,9 +139,10 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 // Starting is persisted before StartInstances, so a retry never rewrites the
 // bootstrap of a machine whose start may have succeeded.
 type runnerClaim struct {
-	ID       string `json:"id"`
-	Starting bool   `json:"starting"`
-	Rejected bool   `json:"rejected"`
+	ID       string     `json:"id"`
+	Starting bool       `json:"starting"`
+	Rejected bool       `json:"rejected"`
+	Cold     *coldClaim `json:"cold,omitempty"`
 }
 
 func saveRunnerClaim(f *os.File, claim runnerClaim) error {

@@ -38,3 +38,17 @@ func TestEarlyBootstrapGuard(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, data, "bfd-early-bootstrap")
 }
+
+func TestEarlyBootstrapRejectsNonLinuxPool(t *testing.T) {
+	for _, osType := range []params.OSType{params.Windows, params.Linux} {
+		t.Run(string(osType), func(t *testing.T) {
+			s := &RunnerSpec{Region: "us-east-1", EarlyBootstrap: true, BootstrapParams: params.BootstrapInstance{Name: "runner", OSType: osType}}
+			err := s.Validate()
+			if osType == params.Linux {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "early_bootstrap requires Linux")
+			}
+		})
+	}
+}

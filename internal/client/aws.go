@@ -260,6 +260,18 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		return id, err
 	}
 
+	return a.createColdInstance(ctx, spec, udata, nil, nil)
+}
+
+func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, udata string, record *os.File, claim *runnerClaim) (string, error) {
+	if claim != nil && claim.Cold != nil && claim.Cold.ID != "" {
+		return claim.Cold.ID, nil
+	}
+	if claim != nil && claim.Cold != nil {
+		if id, err := a.recoverCold(ctx, spec, record, claim); id != "" || err != nil {
+			return id, err
+		}
+	}
 	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
 	root_volume := a.cached(imageKey)
 	if root_volume == "" {
@@ -285,7 +297,19 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 	}
 
 	var lastErr error
-	for _, attempt := range a.launchAttempts(spec) {
+	attempts := a.launchAttempts(spec)
+	if claim != nil && claim.Cold != nil {
+		// An uncertain request must be replayed in its original zone/type before
+		// consulting capacity-cache ordering, which may have changed meanwhile.
+		original := claim.Cold.Attempt
+		attempts = append(attempts[:0:0], original)
+		for _, candidate := range a.launchAttempts(spec) {
+			if candidate != original {
+				attempts = append(attempts, candidate)
+			}
+		}
+	}
+	for _, attempt := range attempts {
 		var subnetID *string
 		if attempt.SubnetID != "" {
 			subnetID = aws.String(attempt.SubnetID)
@@ -349,6 +373,11 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 				},
 			}
 		}
+		if claim != nil {
+			if err := prepareCold(record, claim, spec, attempt, input); err != nil {
+				return "", err
+			}
+		}
 		resp, err := a.client.RunInstances(ctx, input, func(o *ec2.Options) {
 			if o.Retryer == nil {
 				o.Retryer = retry.NewStandard()
@@ -359,11 +388,23 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 			if len(resp.Instances) == 0 || resp.Instances[0].InstanceId == nil {
 				return "", fmt.Errorf("failed to create instance: empty response")
 			}
+			if claim != nil {
+				claim.Cold.ID = *resp.Instances[0].InstanceId
+				if err := saveRunnerClaim(record, *claim); err != nil {
+					return "", err
+				}
+			}
 			return *resp.Instances[0].InstanceId, nil
 		}
 		lastErr = err
 		if !isCapacityError(err) {
 			return "", fmt.Errorf("failed to create instance: %w", err)
+		}
+		if claim != nil {
+			claim.Cold = nil
+			if err := saveRunnerClaim(record, *claim); err != nil {
+				return "", err
+			}
 		}
 		a.remember(placementKey(spec, attempt), "refused", 3*time.Minute)
 		market := "on-demand"

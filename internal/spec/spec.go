@@ -153,6 +153,9 @@ type RunnerSpec struct {
 }
 
 func (r *RunnerSpec) Validate() error {
+	if r.EarlyBootstrap && r.BootstrapParams.OSType != params.Linux {
+		return fmt.Errorf("early_bootstrap requires Linux runners")
+	}
 	if r.StoppedPool != "" && (!r.EarlyBootstrap || r.Spot || r.BootstrapParams.OSType != params.Linux) {
 		return fmt.Errorf("stopped pools require early_bootstrap on on-demand Linux runners")
 	}

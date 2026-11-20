@@ -52,7 +52,11 @@ provider crashes. Only a definitive capacity refusal permits another launch
 after a start attempt. Runner-keyed records in `cache_dir/runner-claims` serialize
 repeat creates and recover the same EC2 ID after a lost response. Retries describe
 that instance, return it when pending/running, or resume its start when stopped;
-an unknown state never causes a cold fallback. Records contain no bootstrap data.
+an unknown state never causes a cold fallback. The lock also covers cold fallback:
+its placement, EC2 idempotency token, request digest and returned ID are persisted.
+A lost RunInstances response is recovered by token lookup or an identical replay
+in the original placement; changed parameters or expired uncertain requests fail
+closed. Records contain no bootstrap data.
 
 The keeper and provider match a SHA-256 fingerprint of the image, allowed
 placements, security groups, instance profile and disk configuration. Reserve
