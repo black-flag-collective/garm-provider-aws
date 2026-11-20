@@ -92,7 +92,7 @@ type extraSpecs struct {
 	// set, across every flavor and subnet, then on-demand unless disabled.
 	Spot             *bool    `json:"spot,omitempty" jsonschema:"description=Launch runners as one-time spot instances first."`
 	OnDemandFallback *bool    `json:"on_demand_fallback,omitempty" jsonschema:"description=When spot is set, fall back to on-demand if no spot capacity is found. Default true."`
-	FallbackSubnets  []string `json:"fallback_subnet_ids,omitempty" jsonschema:"description=More subnets to try, in order, after subnet_id has no capacity."`
+	FallbackSubnets  []string `json:"fallback_subnet_ids,omitempty" jsonschema:"pattern=^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$,description=More subnets to try, in order, after subnet_id has no capacity."`
 	FallbackFlavors  []string `json:"fallback_flavors,omitempty" jsonschema:"description=More instance types to try, in order, after the pool flavor has no capacity."`
 	cloudconfig.CloudConfigSpec
 }

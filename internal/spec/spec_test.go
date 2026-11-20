@@ -672,3 +672,12 @@ func TestCapacityExtraSpecs(t *testing.T) {
 	require.False(t, plain.Spot)
 	require.False(t, plain.SpotOnly)
 }
+
+func TestFallbackSubnetValidation(t *testing.T) {
+	for _, value := range []string{`{"fallback_subnet_ids":["subnet-12345678","subnet-0123456789abcdef0"]}`, `{"fallback_subnet_ids":[]}`} {
+		require.NoError(t, jsonSchemaValidation([]byte(value)))
+	}
+	for _, value := range []string{`{"fallback_subnet_ids":["bad"]}`, `{"fallback_subnet_ids":["subnet-12345678","subnet-no"]}`, `{"fallback_subnet_ids":[""]}`} {
+		require.Error(t, jsonSchemaValidation([]byte(value)))
+	}
+}
