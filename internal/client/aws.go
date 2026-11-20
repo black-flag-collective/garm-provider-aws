@@ -205,6 +205,13 @@ func (a *AwsCli) GetInstance(ctx context.Context, instance string) (types.Instan
 // any attached EBS volumes with the DeleteOnTermination block device mapping parameter set to true are
 // automatically deleted.
 func (a *AwsCli) TerminateInstance(ctx context.Context, vmName string) error {
+	if err := a.terminateInstance(ctx, vmName); err != nil {
+		return err
+	}
+	return a.retireRunnerClaim(vmName)
+}
+
+func (a *AwsCli) terminateInstance(ctx context.Context, vmName string) error {
 	_, err := a.client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
 		InstanceIds: []string{vmName},
 	})
@@ -256,8 +263,24 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		return "", fmt.Errorf("failed to compose user data: %w", err)
 	}
 
+	if id, err := a.claimStopped(ctx, spec, udata); err != nil || id != "" {
+		return id, err
+	}
+
+	return a.createColdInstance(ctx, spec, udata, nil, nil)
+}
+
+func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, udata string, record *os.File, claim *runnerClaim) (string, error) {
 	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
-	root_volume := a.cached(imageKey)
+	root_volume := ""
+	if claim != nil && claim.Cold != nil {
+		root_volume = claim.Cold.RootDevice
+		if root_volume == "" {
+			return "", fmt.Errorf("cold recovery record is missing the root device")
+		}
+	} else {
+		root_volume = a.cached(imageKey)
+	}
 	if root_volume == "" {
 		images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
 			Filters: []types.Filter{
@@ -281,7 +304,19 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 	}
 
 	var lastErr error
-	for _, attempt := range a.launchAttempts(spec) {
+	attempts := a.launchAttempts(spec)
+	if claim != nil && claim.Cold != nil {
+		// An uncertain request must be replayed in its original zone/type before
+		// consulting capacity-cache ordering, which may have changed meanwhile.
+		original := claim.Cold.Attempt
+		attempts = append(attempts[:0:0], original)
+		for _, candidate := range a.launchAttempts(spec) {
+			if candidate != original {
+				attempts = append(attempts, candidate)
+			}
+		}
+	}
+	for _, attempt := range attempts {
 		var subnetID *string
 		if attempt.SubnetID != "" {
 			subnetID = aws.String(attempt.SubnetID)
@@ -345,6 +380,19 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 				},
 			}
 		}
+		if claim != nil {
+			recovering := claim.Cold != nil
+			if err := prepareCold(record, claim, spec, attempt, input); err != nil {
+				return "", err
+			}
+			// Validate the current request before every recovery path, including
+			// a saved successful ID. A token lookup cannot bypass this check.
+			if recovering {
+				if id, err := a.recoverCold(ctx, spec, record, claim); id != "" || err != nil {
+					return id, err
+				}
+			}
+		}
 		resp, err := a.client.RunInstances(ctx, input, func(o *ec2.Options) {
 			if o.Retryer == nil {
 				o.Retryer = retry.NewStandard()
@@ -355,11 +403,23 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 			if len(resp.Instances) == 0 || resp.Instances[0].InstanceId == nil {
 				return "", fmt.Errorf("failed to create instance: empty response")
 			}
+			if claim != nil {
+				claim.Cold.ID = *resp.Instances[0].InstanceId
+				if err := saveRunnerClaim(record, *claim); err != nil {
+					return "", err
+				}
+			}
 			return *resp.Instances[0].InstanceId, nil
 		}
 		lastErr = err
 		if !isCapacityError(err) {
 			return "", fmt.Errorf("failed to create instance: %w", err)
+		}
+		if claim != nil {
+			claim.Cold = nil
+			if err := saveRunnerClaim(record, *claim); err != nil {
+				return "", err
+			}
 		}
 		a.remember(placementKey(spec, attempt), "refused", 3*time.Minute)
 		market := "on-demand"

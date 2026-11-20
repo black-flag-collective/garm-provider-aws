@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/cloudbase/garm-provider-aws/config"
@@ -77,6 +78,8 @@ func newExtraSpecsFromBootstrapData(data params.BootstrapInstance) (*extraSpecs,
 }
 
 type extraSpecs struct {
+	StoppedPool        string           `json:"stopped_pool,omitempty" jsonschema:"description=Prebooted one-use stopped pool name."`
+	EarlyBootstrap     bool             `json:"early_bootstrap,omitempty" jsonschema:"description=Use the preinstalled Black Flag early bootstrap helper."`
 	SubnetID           *string          `json:"subnet_id,omitempty" jsonschema:"pattern=^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$,description=The ID of the subnet formatted as subnet-xxxxxxxxxxxxxxxxx."`
 	SSHKeyName         *string          `json:"ssh_key_name,omitempty" jsonschema:"description=The name of the Key Pair to use for the instance."`
 	IAMInstanceProfile *string          `json:"iam_instance_profile,omitempty" jsonschema:"description=The IAM instance profile to associate with the instance."`
@@ -127,6 +130,8 @@ func GetRunnerSpecFromBootstrapParams(cfg *config.Config, data params.BootstrapI
 }
 
 type RunnerSpec struct {
+	EarlyBootstrap     bool
+	StoppedPool        string
 	Region             string
 	DisableUpdates     bool
 	ExtraPackages      []string
@@ -149,6 +154,12 @@ type RunnerSpec struct {
 }
 
 func (r *RunnerSpec) Validate() error {
+	if r.EarlyBootstrap && r.BootstrapParams.OSType != params.Linux {
+		return fmt.Errorf("early_bootstrap requires Linux runners")
+	}
+	if r.StoppedPool != "" && (!r.EarlyBootstrap || r.Spot || r.BootstrapParams.OSType != params.Linux) {
+		return fmt.Errorf("stopped pools require early_bootstrap on on-demand Linux runners")
+	}
 	if r.Region == "" {
 		return fmt.Errorf("missing region")
 	}
@@ -215,6 +226,8 @@ func (r *RunnerSpec) Validate() error {
 }
 
 func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+	r.StoppedPool = extraSpecs.StoppedPool
+	r.EarlyBootstrap = extraSpecs.EarlyBootstrap
 	if extraSpecs.Spot != nil {
 		r.Spot = *extraSpecs.Spot
 	}
@@ -265,8 +278,11 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
 	}
 
 	if extraSpecs.IAMInstanceProfile != nil {
-		r.IAMInstanceProfile = &types.IamInstanceProfileSpecification{
-			Arn: extraSpecs.IAMInstanceProfile,
+		r.IAMInstanceProfile = &types.IamInstanceProfileSpecification{}
+		if strings.HasPrefix(*extraSpecs.IAMInstanceProfile, "arn:") {
+			r.IAMInstanceProfile.Arn = extraSpecs.IAMInstanceProfile
+		} else {
+			r.IAMInstanceProfile.Name = extraSpecs.IAMInstanceProfile
 		}
 	}
 }
@@ -327,7 +343,7 @@ func (r *RunnerSpec) ComposeUserData() (string, error) {
 	var udata []byte
 	switch bootstrapParams.OSType {
 	case params.Linux:
-		cloudCfg, err := cloudconfig.GetCloudConfig(bootstrapParams, r.Tools, bootstrapParams.Name)
+		cloudCfg, err := linuxCloudConfig(bootstrapParams, r.Tools)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate userdata: %w", err)
 		}
