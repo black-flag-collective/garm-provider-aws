@@ -2,6 +2,9 @@ package client
 
 import (
 	"context"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/cloudbase/garm-provider-aws/config"
+	"net/http"
 	"testing"
 	"time"
 
@@ -60,4 +63,31 @@ func TestCachedImageSkipsDescribe(t *testing.T) {
 	_, err = cli.CreateRunningInstance(context.Background(), capacitySpec(false))
 	require.NoError(t, err)
 	m.AssertNumberOfCalls(t, "DescribeImages", 1)
+}
+
+func TestClientRetainsCapacityRetriesOutsideRunInstances(t *testing.T) {
+	cli, err := NewAwsCli(context.Background(), &config.Config{Region: "us-east-1", SubnetID: "subnet-12345678", Credentials: config.Credentials{CredentialType: config.AWSCredentialTypeStatic, StaticCredentials: config.StaticCredentials{AccessKeyID: "test", SecretAccessKey: "test"}}})
+	require.NoError(t, err)
+	capacity := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 503}}, Err: noCapacity}
+	standard := cli.client.(*ec2.Client).Options().Retryer
+	require.True(t, standard.IsErrorRetryable(capacity))
+	require.False(t, placementRetryer{standard}.IsErrorRetryable(capacity))
+}
+
+func TestOnlyRunInstancesReceivesPlacementRetryOverride(t *testing.T) {
+	cli, m := newCapacityCli(t)
+	m.On("RunInstances", mock.Anything, mock.Anything, mock.MatchedBy(func(options []func(*ec2.Options)) bool {
+		if len(options) != 1 {
+			return false
+		}
+		opts := ec2.Options{Retryer: retry.NewStandard()}
+		options[0](&opts)
+		_, ok := opts.Retryer.(placementRetryer)
+		return ok
+	})).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-test")}}}, nil).Once()
+	m.On("StartInstances", mock.Anything, mock.Anything, mock.MatchedBy(func(options []func(*ec2.Options)) bool { return len(options) == 0 })).Return(&ec2.StartInstancesOutput{}, nil).Once()
+	_, err := cli.CreateRunningInstance(context.Background(), capacitySpec(false))
+	require.NoError(t, err)
+	require.NoError(t, cli.StartInstance(context.Background(), "i-test"))
+	m.AssertExpectations(t)
 }

@@ -42,12 +42,7 @@ func NewAwsCli(ctx context.Context, cfg *config.Config) (*AwsCli, error) {
 		return nil, fmt.Errorf("failed to get AWS cli context: %w", err)
 	}
 
-	client := ec2.NewFromConfig(cliCfg, func(o *ec2.Options) {
-		if o.Retryer == nil {
-			o.Retryer = retry.NewStandard()
-		}
-		o.Retryer = placementRetryer{o.Retryer}
-	})
+	client := ec2.NewFromConfig(cliCfg)
 	awsCli := &AwsCli{
 		cfg:    cfg,
 		client: client,
@@ -350,7 +345,12 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 				},
 			}
 		}
-		resp, err := a.client.RunInstances(ctx, input)
+		resp, err := a.client.RunInstances(ctx, input, func(o *ec2.Options) {
+			if o.Retryer == nil {
+				o.Retryer = retry.NewStandard()
+			}
+			o.Retryer = placementRetryer{o.Retryer}
+		})
 		if err == nil {
 			if len(resp.Instances) == 0 || resp.Instances[0].InstanceId == nil {
 				return "", fmt.Errorf("failed to create instance: empty response")

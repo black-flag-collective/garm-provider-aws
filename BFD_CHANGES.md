@@ -21,7 +21,7 @@ Releases are tagged `v0.1.6-bfd.N` with the same asset names as upstream.
 
 ## v0.1.6-bfd.2
 
-Capacity refusals bypass SDK retries so the next placement is tried immediately.
+RunInstances capacity refusals bypass SDK retries so the next placement is tried immediately.
 Throttling and other transient errors retain AWS's standard retry policy.
 Recently refused placements are tried last within their market for three minutes;
 none are excluded, and spot still precedes on-demand. AMI root device lookups
