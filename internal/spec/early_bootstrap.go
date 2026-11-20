@@ -19,7 +19,7 @@ func linuxCloudConfig(p params.BootstrapInstance, tools params.RunnerApplication
 	if !extra.EarlyBootstrap {
 		return cloudconfig.GetCloudConfig(p, tools, p.Name)
 	}
-	if !p.UserDataOptions.DisableUpdatesOnBoot || len(p.UserDataOptions.ExtraPackages) > 0 || len(extra.PreInstallScripts) > 0 || p.CACertBundle != nil || !p.JitConfigEnabled {
+	if !p.UserDataOptions.DisableUpdatesOnBoot || len(p.UserDataOptions.ExtraPackages) > 0 || len(extra.PreInstallScripts) > 0 || len(p.CACertBundle) > 0 || !p.JitConfigEnabled {
 		return "", fmt.Errorf("early bootstrap requires a preconfigured JIT image without updates, packages, preinstall scripts or custom CA")
 	}
 	script, err := cloudconfig.GetRunnerInstallScript(p, tools, p.Name)
