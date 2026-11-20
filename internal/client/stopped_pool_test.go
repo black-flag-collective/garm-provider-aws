@@ -3,12 +3,14 @@ package client
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -265,4 +267,78 @@ func TestUnknownClaimStateNeverFallsBack(t *testing.T) {
 	require.ErrorContains(t, err, "not yet visible")
 	m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
 	m.AssertExpectations(t)
+}
+
+func TestResumedClaimRejectsChangedPlan(t *testing.T) {
+	for _, change := range []string{"request", "image", "tag"} {
+		t.Run(change, func(t *testing.T) {
+			cli, m := newCapacityCli(t)
+			m.ExpectedCalls[0].Maybe()
+			cli.cacheDir = t.TempDir()
+			s := capacitySpec(false)
+			s.StoppedPool = "bfd-linux"
+			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
+			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
+			m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost response")).Once()
+			_, err := cli.CreateRunningInstance(context.Background(), s)
+			require.Error(t, err)
+			switch change {
+			case "request":
+				s.BootstrapParams.Image = "ami-new"
+			case "image":
+				candidate.ImageId = aws.String("ami-other")
+			case "tag":
+				candidate.Tags[2].Value = aws.String("other-plan")
+			}
+			if change != "request" {
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			}
+			other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+			_, err = other.CreateRunningInstance(context.Background(), s)
+			require.ErrorContains(t, err, "does not match requested plan")
+			m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+			m.AssertExpectations(t)
+		})
+	}
+}
+
+func TestClaimStateUsesAtomicReplacementAndStableLock(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := os.OpenFile(filepath.Join(dir, "runner.lock"), os.O_RDWR|os.O_CREATE, 0600)
+	require.NoError(t, err)
+	defer lock.Close()
+	require.NoError(t, lockClaim(lock))
+	before, err := lock.Stat()
+	require.NoError(t, err)
+	first := runnerClaim{ID: "i-first", Plan: "plan"}
+	require.NoError(t, saveRunnerClaim(lock, first))
+	snapshot, err := os.Open(lock.Name() + ".json")
+	require.NoError(t, err)
+	defer snapshot.Close()
+	firstInfo, err := snapshot.Stat()
+	require.NoError(t, err)
+	require.NoError(t, saveRunnerClaim(lock, runnerClaim{ID: "i-second", Plan: "plan", Starting: true}))
+	oldData, err := io.ReadAll(snapshot)
+	require.NoError(t, err)
+	var old runnerClaim
+	require.NoError(t, json.Unmarshal(oldData, &old))
+	require.Equal(t, first, old)
+	data, err := os.ReadFile(lock.Name() + ".json")
+	require.NoError(t, err)
+	var current runnerClaim
+	require.NoError(t, json.Unmarshal(data, &current))
+	require.Equal(t, "i-second", current.ID)
+	require.True(t, current.Starting)
+	after, err := os.Stat(lock.Name())
+	require.NoError(t, err)
+	require.True(t, os.SameFile(before, after))
+	stateInfo, err := os.Stat(lock.Name() + ".json")
+	require.NoError(t, err)
+	require.False(t, os.SameFile(firstInfo, stateInfo))
+	require.Equal(t, os.FileMode(0600), stateInfo.Mode().Perm())
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
 }

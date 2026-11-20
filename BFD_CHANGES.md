@@ -56,7 +56,10 @@ an unknown state never causes a cold fallback. The lock also covers cold fallbac
 its placement, EC2 idempotency token, request digest and returned ID are persisted.
 A lost RunInstances response is recovered by token lookup or an identical replay
 in the original placement; changed parameters or expired uncertain requests fail
-closed. Records contain no bootstrap data.
+closed. Claim JSON is atomically replaced under a separate permanent lock; records
+contain no bootstrap data. Resumed reserves must still match the requested
+plan and image. Named IAM profiles are fingerprinted distinctly from ARNs and
+from other names, using the same encoding as the keeper.
 
 The keeper and provider match a SHA-256 fingerprint of the image, allowed
 placements, security groups, instance profile and disk configuration. Reserve

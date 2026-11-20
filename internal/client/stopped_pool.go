@@ -58,7 +58,7 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 	if err := os.MkdirAll(runnerDir, 0700); err != nil {
 		return "", err
 	}
-	record, err := os.OpenFile(filepath.Join(runnerDir, key), os.O_RDWR|os.O_CREATE, 0600)
+	record, err := os.OpenFile(filepath.Join(runnerDir, key+".lock"), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return "", err
 	}
@@ -66,8 +66,8 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 	if err := lockClaim(record); err != nil {
 		return "", err
 	}
-	data, err := io.ReadAll(record)
-	if err != nil {
+	data, err := os.ReadFile(record.Name() + ".json")
+	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
 	var claim runnerClaim
@@ -113,7 +113,7 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 			}
 			// Persist the selected instance before reserving it. No EC2 mutation can
 			// happen without this runner's recovery record already on disk.
-			*claim = runnerClaim{ID: id}
+			*claim = runnerClaim{ID: id, Plan: s.StoppedPlan()}
 			if err := saveRunnerClaim(record, *claim); err != nil {
 				return "", err
 			}
@@ -140,26 +140,39 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 // bootstrap of a machine whose start may have succeeded.
 type runnerClaim struct {
 	ID       string     `json:"id"`
+	Plan     string     `json:"plan,omitempty"`
 	Starting bool       `json:"starting"`
 	Rejected bool       `json:"rejected"`
 	Cold     *coldClaim `json:"cold,omitempty"`
 }
 
-func saveRunnerClaim(f *os.File, claim runnerClaim) error {
+// The lock inode is permanent. State is replaced atomically beside it, so
+// readers cannot lock an obsolete inode after a rename or observe torn JSON.
+func saveRunnerClaim(lock *os.File, claim runnerClaim) error {
 	data, err := json.Marshal(claim)
 	if err != nil {
 		return err
 	}
-	if _, err = f.WriteAt(data, 0); err != nil {
+	dir := filepath.Dir(lock.Name())
+	temp, err := os.CreateTemp(dir, ".claim-state-")
+	if err != nil {
 		return err
 	}
-	if err = f.Truncate(int64(len(data))); err != nil {
+	defer os.Remove(temp.Name())
+	defer temp.Close()
+	if _, err := temp.Write(data); err != nil {
 		return err
 	}
-	if err = f.Sync(); err != nil {
+	if err := temp.Sync(); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(f.Name()))
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp.Name(), lock.Name()+".json"); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
 }
 
 func syncDirectory(path string) error {
@@ -217,6 +230,9 @@ func reserveStopped(dir, id, name string) (*os.File, error) {
 }
 
 func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, dir string, record *os.File, claim *runnerClaim) (string, error) {
+	if claim.Plan != s.StoppedPlan() {
+		return "", fmt.Errorf("persisted stopped claim does not match requested plan")
+	}
 	if filepath.Base(claim.ID) != claim.ID {
 		return "", fmt.Errorf("invalid persisted instance ID")
 	}
@@ -244,6 +260,9 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 			}
 			if tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
 				return "", fmt.Errorf("claimed runner controller mismatch")
+			}
+			if aws.ToString(instance.ImageId) != s.BootstrapParams.Image || tagValue(instance.Tags, "BFD_STOPPED_PLAN") != claim.Plan {
+				return "", fmt.Errorf("claimed runner does not match requested plan")
 			}
 			switch instance.State.Name {
 			case types.InstanceStateNamePending, types.InstanceStateNameRunning:

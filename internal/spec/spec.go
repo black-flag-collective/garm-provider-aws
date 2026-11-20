@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/cloudbase/garm-provider-aws/config"
@@ -277,8 +278,11 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
 	}
 
 	if extraSpecs.IAMInstanceProfile != nil {
-		r.IAMInstanceProfile = &types.IamInstanceProfileSpecification{
-			Arn: extraSpecs.IAMInstanceProfile,
+		r.IAMInstanceProfile = &types.IamInstanceProfileSpecification{}
+		if strings.HasPrefix(*extraSpecs.IAMInstanceProfile, "arn:") {
+			r.IAMInstanceProfile.Arn = extraSpecs.IAMInstanceProfile
+		} else {
+			r.IAMInstanceProfile.Name = extraSpecs.IAMInstanceProfile
 		}
 	}
 }

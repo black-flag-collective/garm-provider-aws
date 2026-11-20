@@ -19,6 +19,9 @@ func (s *RunnerSpec) StoppedPlan() string {
 	profile := ""
 	if s.IAMInstanceProfile != nil {
 		profile = aws.ToString(s.IAMInstanceProfile.Arn)
+		if profile == "" && aws.ToString(s.IAMInstanceProfile.Name) != "" {
+			profile = "name:" + aws.ToString(s.IAMInstanceProfile.Name)
+		}
 	}
 	values := []string{s.BootstrapParams.Image, strings.Join(append([]string{s.BootstrapParams.Flavor}, s.FallbackFlavors...), ","), strings.Join(append([]string{s.SubnetID}, s.FallbackSubnets...), ","), strings.Join(groups, ","), profile, fmt.Sprint(aws.ToInt32(s.VolumeSize)), string(s.VolumeType), fmt.Sprint(aws.ToInt32(s.Iops)), fmt.Sprint(aws.ToInt32(s.Throughput)), aws.ToString(s.SSHKeyName)}
 	data, _ := json.Marshal(values)

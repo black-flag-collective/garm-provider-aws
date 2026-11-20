@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,16 +111,16 @@ func TestUnknownColdOutcomeNeverChangesRequestOrReplaysExpiredToken(t *testing.T
 			_, err := cli.CreateRunningInstance(context.Background(), s)
 			require.Error(t, err)
 			if expired {
-				files, err := os.ReadDir(filepath.Join(cli.cacheDir, "runner-claims"))
+				files, err := filepath.Glob(filepath.Join(cli.cacheDir, "runner-claims", "*.lock"))
 				require.NoError(t, err)
 				require.Len(t, files, 1)
-				path := filepath.Join(cli.cacheDir, "runner-claims", files[0].Name())
+				path := files[0] + ".json"
 				data, err := os.ReadFile(path)
 				require.NoError(t, err)
 				var claim runnerClaim
 				require.NoError(t, json.Unmarshal(data, &claim))
 				claim.Cold.Created = time.Now().Add(-13 * time.Hour)
-				f, err := os.OpenFile(path, os.O_RDWR, 0600)
+				f, err := os.OpenFile(strings.TrimSuffix(path, ".json"), os.O_RDWR, 0600)
 				require.NoError(t, err)
 				require.NoError(t, saveRunnerClaim(f, claim))
 				require.NoError(t, f.Close())
