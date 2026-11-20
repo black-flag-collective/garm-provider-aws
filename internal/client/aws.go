@@ -378,7 +378,7 @@ var capacityErrors = []string{
 	"InsufficientHostCapacity",
 	"SpotMaxPriceTooLow",
 	"MaxSpotInstanceCountExceeded",
-	"Unsupported",
+	"InsufficientFreeAddressesInSubnet",
 	"UnfulfillableCapacity",
 }
 
@@ -386,6 +386,10 @@ func isCapacityError(err error) bool {
 	var apiErr smithy.APIError
 	if !stderrors.As(err, &apiErr) {
 		return false
+	}
+	if apiErr.ErrorCode() == "Unsupported" {
+		message := strings.ToLower(apiErr.ErrorMessage())
+		return strings.Contains(message, "requested instance type") && strings.Contains(message, "not supported") && strings.Contains(message, "availability zone")
 	}
 	for _, code := range capacityErrors {
 		if apiErr.ErrorCode() == code {

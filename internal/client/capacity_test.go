@@ -127,3 +127,23 @@ func TestCreateRunningInstanceReportsWhenEveryPlacementIsFull(t *testing.T) {
 	require.ErrorContains(t, err, "no capacity in any placement")
 	m.AssertNumberOfCalls(t, "RunInstances", 8)
 }
+
+func TestSubnetAddressExhaustionFallsBack(t *testing.T) {
+	cli, m := newCapacityCli(t)
+	m.On("RunInstances", mock.Anything, mock.MatchedBy(placement(false, "m8a.large", "subnet-aaaaaaaa")), mock.Anything).Return((*ec2.RunInstancesOutput)(nil), &smithy.GenericAPIError{Code: "InsufficientFreeAddressesInSubnet"}).Once()
+	m.On("RunInstances", mock.Anything, mock.MatchedBy(placement(false, "m8a.large", "subnet-bbbbbbbb")), mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-next")}}}, nil).Once()
+	id, err := cli.CreateRunningInstance(context.Background(), capacitySpec(false))
+	require.NoError(t, err)
+	require.Equal(t, "i-next", id)
+	m.AssertExpectations(t)
+}
+func TestUnsupportedRequiresPlacementSpecificMessage(t *testing.T) {
+	require.False(t, isCapacityError(&smithy.GenericAPIError{Code: "Unsupported", Message: "The requested configuration is not supported"}))
+	err := &smithy.GenericAPIError{Code: "Unsupported", Message: "Your requested instance type (m8a.large) is not supported in your requested Availability Zone (us-east-1a)."}
+	require.True(t, isCapacityError(err))
+	cli, m := newCapacityCli(t)
+	m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.RunInstancesOutput)(nil), &smithy.GenericAPIError{Code: "Unsupported", Message: "Unsupported configuration"}).Once()
+	_, err = cli.CreateRunningInstance(context.Background(), capacitySpec(false))
+	require.Error(t, err)
+	m.AssertNumberOfCalls(t, "RunInstances", 1)
+}
