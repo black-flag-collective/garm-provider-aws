@@ -310,6 +310,7 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 func (a *AwsCli) startClaimed(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, record *os.File, claim *runnerClaim) (string, error) {
 	id := claim.ID
 	if !claim.Starting {
+		// EC2 SDK v1.338.1: api_op_ModifyInstanceAttribute.go:159 requires SecureBlobAttributeValue, defined in types/types.go:21669.
 		_, err := cli.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{InstanceId: aws.String(id), UserData: &types.SecureBlobAttributeValue{Value: decoded}})
 		if err != nil {
 			return "", fmt.Errorf("set stopped runner user data: %w", err)
