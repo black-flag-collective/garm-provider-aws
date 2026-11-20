@@ -3,6 +3,7 @@ package spec
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,4 +91,67 @@ func assertGeneratedEarlyUnitRuns(t *testing.T, script []byte) {
 	// A failed write must propagate instead of installing the original gated unit.
 	output, err = exec.Command(bash, "-eu", "-c", function+"\nbfdConfigureEarlyUnit \"$1\"", "test", filepath.Join(dir, "missing", "runner.service")).CombinedOutput()
 	require.Error(t, err, string(output))
+}
+
+// This fixture is GARM v0.2.1's internal/templates/userdata/linux_wrapper.tmpl.
+// Unlike provider-common's inline default, it downloads the actual template.
+func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
+	wrapper, err := os.ReadFile("testdata/garm-v0.2.1-linux-wrapper.tmpl")
+	require.NoError(t, err)
+	extra, err := json.Marshal(map[string]any{"early_bootstrap": true, "runner_install_template": wrapper})
+	require.NoError(t, err)
+	p := params.BootstrapInstance{Name: "runner", OSType: params.Linux, JitConfigEnabled: true, ExtraSpecs: extra}
+	p.UserDataOptions.DisableUpdatesOnBoot = true
+	tools := params.RunnerApplicationDownload{OS: aws.String("linux"), Architecture: aws.String("amd64"), DownloadURL: aws.String("https://example.test/runner"), Filename: aws.String("runner.tgz")}
+	data, err := linuxCloudConfig(p, tools)
+	require.NoError(t, err)
+	var config struct {
+		Files []struct {
+			Content string `yaml:"content"`
+		} `yaml:"write_files"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(data), &config))
+	script, err := base64.StdEncoding.DecodeString(config.Files[0].Content)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "bfd-bootstrap-once")
+	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/bash\nexit 99\n"), 0700))
+	downloaded := filepath.Join(dir, "real-install.sh")
+	body := strings.ReplaceAll(string(script), "/usr/local/sbin/bfd-bootstrap-once", helper)
+	body = strings.ReplaceAll(body, "/tmp/real-install.sh", downloaded)
+	path := filepath.Join(dir, "bootstrap.sh")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0700))
+	out, err := exec.Command("bash", "-n", path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	// Mock network and privileged install boundaries, but execute the complete
+	// generated wrapper, its downloaded script, and the real unit transformation.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "curl"), []byte("#!/bin/bash\ncp \"$BFD_FIXTURE\" \"${@: -1}\"\n"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sudo"), []byte("#!/bin/bash\n[[ $1 == mv ]] || exit 98\ncp \"$2\" \"$BFD_RESULT\"\n"), 0700))
+	fixture := filepath.Join(dir, "install-fixture.sh")
+	result := filepath.Join(dir, "installed.service")
+	valid := "#!/bin/bash\nset -e\nSVC_NAME=runner.service\nprintf '%s\\n' '[Unit]' 'After=network.target' '[Service]' 'ExecStart=/runner' > \"$SVC_NAME\"\nsudo mv $SVC_NAME /etc/systemd/system/ || exit 1\n"
+	for _, supported := range []bool{true, false} {
+		t.Run(fmt.Sprint(supported), func(t *testing.T) {
+			content := valid
+			if !supported {
+				content = "#!/bin/bash\necho should-not-run > \"$BFD_RESULT\"\n"
+			}
+			require.NoError(t, os.WriteFile(fixture, []byte(content), 0700))
+			_ = os.Remove(result)
+			cmd := exec.Command("bash", path)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "BFD_BOOTSTRAP_LOCKED=1", "BFD_FIXTURE="+fixture, "BFD_RESULT="+result)
+			out, err := cmd.CombinedOutput()
+			if !supported {
+				require.Error(t, err)
+				require.NoFileExists(t, result)
+				return
+			}
+			require.NoError(t, err, string(out))
+			unit, err := os.ReadFile(result)
+			require.NoError(t, err)
+			require.Contains(t, string(unit), "DefaultDependencies=no\nAfter=local-fs.target systemd-networkd.service\n")
+			require.NoFileExists(t, downloaded)
+		})
+	}
 }

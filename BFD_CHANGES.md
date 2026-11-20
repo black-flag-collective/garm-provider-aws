@@ -72,3 +72,11 @@ placements, security groups, instance profile and disk configuration. Reserve
 instances carry `GARM_CONTROLLER_ID`, `BFD_STOPPED_POOL`, and
 `BFD_STOPPED_PLAN`, but never `GARM_POOL_ID` until claimed. Both processes run
 on the single GARM host and share the persistent cache volume.
+
+## v0.1.6-bfd.4
+
+Early bootstrap also accepts GARM v0.2.1's download wrapper. After the wrapper
+fetches the real install script, it adds the early systemd ordering adjustment
+before service installation, then executes GARM's script with its normal
+callbacks. Unknown downloaded templates fail before execution. Regression tests
+execute the generated wrapper with a mocked download and service-install boundary.

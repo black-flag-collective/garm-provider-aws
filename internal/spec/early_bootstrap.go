@@ -38,7 +38,7 @@ fi
 	// GARM's generated service otherwise waits for sysinit via its default
 	// dependencies and network.target, undoing the early bootstrap benefit.
 	old := "sudo mv $SVC_NAME /etc/systemd/system/"
-	replacement := `# bfd-early-unit-begin
+	unitFunction := `# bfd-early-unit-begin
 bfdConfigureEarlyUnit() {
  local unit_file="$1" line
  {
@@ -53,13 +53,51 @@ bfdConfigureEarlyUnit() {
  mv -- "$unit_file.bfd-early" "$unit_file"
 }
 # bfd-early-unit-end
+`
+	replacement := unitFunction + `
 if [[ -x /usr/local/sbin/bfd-bootstrap-once ]]; then
  bfdConfigureEarlyUnit "$SVC_NAME" || fail "failed to configure early runner service"
 fi
 ` + old
-	if !strings.Contains(string(script), old) {
+	if strings.Contains(string(script), old) {
+		script = []byte(strings.Replace(string(script), old, replacement, 1))
+	} else if strings.Contains(string(script), "\n/tmp/real-install.sh\n") {
+		// GARM v0.2.1 supplies a wrapper, not its actual install template. Patch
+		// the downloaded script before execution, preserving GARM's callbacks.
+		prepare := unitFunction + `# bfd-early-prepare-begin
+bfdWriteEarlyInstall() {
+ local script="$1" line count=0
+  printf '%s\n' '#!/bin/bash' || return 1
+  declare -f bfdConfigureEarlyUnit || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+   if [[ "$line" == *'sudo mv $SVC_NAME /etc/systemd/system/'* ]]; then
+    printf '%s\n' 'bfdConfigureEarlyUnit "$SVC_NAME" || exit 1' || return 1
+    count=$((count + 1))
+   fi
+   printf '%s\n' "$line" || return 1
+  done < "$script"
+ if [[ "$count" != 1 ]]; then
+  echo 'early bootstrap: unsupported downloaded install template' >&2
+  return 1
+ fi
+}
+bfdPrepareEarlyInstall() {
+ local script="$1" temporary
+ temporary=$(mktemp "$script.bfd-early.XXXXXX") || return 1
+ bfdWriteEarlyInstall "$script" > "$temporary" && chmod 0700 "$temporary" && mv -- "$temporary" "$script" || {
+  rm -f -- "$temporary"
+  return 1
+ }
+}
+# bfd-early-prepare-end
+if [[ -x /usr/local/sbin/bfd-bootstrap-once ]]; then
+ bfdPrepareEarlyInstall /tmp/real-install.sh || exit 1
+fi
+/tmp/real-install.sh
+`
+		script = []byte(strings.Replace(string(script), "\n/tmp/real-install.sh\n", "\n"+prepare, 1))
+	} else {
 		return "", fmt.Errorf("early bootstrap: unsupported runner install template")
 	}
-	script = []byte(strings.Replace(string(script), old, replacement, 1))
 	return cloudconfig.GetCloudInitConfig(p, script)
 }
