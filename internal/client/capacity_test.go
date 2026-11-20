@@ -139,11 +139,11 @@ func TestSubnetAddressExhaustionFallsBack(t *testing.T) {
 }
 func TestUnsupportedRequiresPlacementSpecificMessage(t *testing.T) {
 	require.False(t, isCapacityError(&smithy.GenericAPIError{Code: "Unsupported", Message: "The requested configuration is not supported"}))
-	err := &smithy.GenericAPIError{Code: "Unsupported", Message: "Your requested instance type (m8a.large) is not supported in your requested Availability Zone (us-east-1a)."}
-	require.True(t, isCapacityError(err))
+	placementErr := &smithy.GenericAPIError{Code: "Unsupported", Message: "Your requested instance type (m8a.large) is not supported in your requested Availability Zone (us-east-1a)."}
+	require.True(t, isCapacityError(placementErr))
 	cli, m := newCapacityCli(t)
 	m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.RunInstancesOutput)(nil), &smithy.GenericAPIError{Code: "Unsupported", Message: "Unsupported configuration"}).Once()
-	_, err = cli.CreateRunningInstance(context.Background(), capacitySpec(false))
+	_, err := cli.CreateRunningInstance(context.Background(), capacitySpec(false))
 	require.Error(t, err)
 	m.AssertNumberOfCalls(t, "RunInstances", 1)
 }
