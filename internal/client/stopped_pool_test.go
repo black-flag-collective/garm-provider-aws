@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -76,4 +77,42 @@ func TestClaimRejectsInstanceAlreadyOwnedByGarm(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, id)
 	m.AssertNotCalled(t, "ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestStartFailureOnlyFallsBackWhenOutcomeIsDefinitive(t *testing.T) {
+	for _, capacity := range []bool{false, true} {
+		t.Run(fmt.Sprint(capacity), func(t *testing.T) {
+			cli, m := newCapacityCli(t)
+			m.ExpectedCalls[0].Maybe()
+			cli.cacheDir = t.TempDir()
+			s := capacitySpec(false)
+			s.StoppedPool = "bfd-linux"
+			candidate := types.Instance{InstanceId: aws.String("i-claim"), ImageId: aws.String(s.BootstrapParams.Image), State: &types.InstanceState{Name: types.InstanceStateNameStopped}, Tags: []types.Tag{
+				{Key: aws.String("GARM_CONTROLLER_ID"), Value: aws.String(s.ControllerID)},
+				{Key: aws.String("BFD_STOPPED_POOL"), Value: aws.String(s.StoppedPool)},
+				{Key: aws.String("BFD_STOPPED_PLAN"), Value: aws.String(s.StoppedPlan())},
+			}}
+			m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}}}, nil)
+			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
+			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
+			var startErr error = fmt.Errorf("transport timeout: outcome unknown")
+			if capacity {
+				startErr = noCapacity
+				m.On("TerminateInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.TerminateInstancesOutput{}, nil).Once()
+				m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}, nil).Once()
+			}
+			m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), startErr).Once()
+			id, err := cli.CreateRunningInstance(context.Background(), s)
+			if capacity {
+				require.NoError(t, err)
+				require.Equal(t, "i-cold", id)
+			} else {
+				require.ErrorContains(t, err, "outcome may be uncertain")
+				require.Empty(t, id)
+				m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+				m.AssertNotCalled(t, "TerminateInstances", mock.Anything, mock.Anything, mock.Anything)
+			}
+			m.AssertExpectations(t)
+		})
+	}
 }
