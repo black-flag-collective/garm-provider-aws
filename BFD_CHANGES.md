@@ -49,7 +49,10 @@ owns unclaimed instances; GARM owns claimed instances and terminates them after
 one job. Durable exclusive claim files and process locks in `cache_dir/claims`
 prevent reuse across concurrent provider processes, stale EC2 listings and
 provider crashes. Only a definitive capacity refusal permits another launch
-after a start attempt; an ambiguous response is returned without duplication.
+after a start attempt. Runner-keyed records in `cache_dir/runner-claims` serialize
+repeat creates and recover the same EC2 ID after a lost response. Retries describe
+that instance, return it when pending/running, or resume its start when stopped;
+an unknown state never causes a cold fallback. Records contain no bootstrap data.
 
 The keeper and provider match a SHA-256 fingerprint of the image, allowed
 placements, security groups, instance profile and disk configuration. Reserve

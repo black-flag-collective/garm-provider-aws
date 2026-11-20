@@ -2,10 +2,14 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -47,9 +51,34 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 	if err := os.MkdirAll(claimDir, 0700); err != nil {
 		return "", err
 	}
-	// The GARM controller is single-host. O_EXCL is the lock across its provider
-	// processes; the durable file is a permanent one-use tombstone, even if EC2
-	// returns stale tags to the next concurrent DescribeInstances call.
+	// Serialize all retries for this GARM runner across provider processes. The
+	// record survives both process exit and an ambiguous EC2 response.
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(s.ControllerID+"/"+s.BootstrapParams.PoolID+"/"+s.BootstrapParams.Name)))
+	runnerDir := filepath.Join(a.cacheDir, "runner-claims")
+	if err := os.MkdirAll(runnerDir, 0700); err != nil {
+		return "", err
+	}
+	record, err := os.OpenFile(filepath.Join(runnerDir, key), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer record.Close()
+	if err := lockClaim(record); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(record)
+	if err != nil {
+		return "", err
+	}
+	var claim runnerClaim
+	if len(data) != 0 {
+		if err := json.Unmarshal(data, &claim); err != nil {
+			return "", fmt.Errorf("read runner claim: %w", err)
+		}
+	}
+	if claim.ID != "" {
+		return a.resumeStopped(ctx, s, cli, decoded, claimDir, record, &claim)
+	}
 	response, err := a.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
 		{Name: aws.String("tag:GARM_CONTROLLER_ID"), Values: []string{s.ControllerID}},
 		{Name: aws.String("tag:BFD_STOPPED_POOL"), Values: []string{s.StoppedPool}},
@@ -70,54 +99,209 @@ func (a *AwsCli) claimStopped(ctx context.Context, s *spec.RunnerSpec, userData 
 			if aws.ToString(instance.ImageId) != s.BootstrapParams.Image || tagValue(instance.Tags, "BFD_STOPPED_PLAN") != s.StoppedPlan() || tagValue(instance.Tags, "BFD_STOPPED_POOL") != s.StoppedPool || tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
 				continue
 			}
-			f, err := os.OpenFile(filepath.Join(claimDir, id), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			// Persist the selected instance before reserving it. No EC2 mutation can
+			// happen without this runner's recovery record already on disk.
+			claim = runnerClaim{ID: id}
+			if err := saveRunnerClaim(record, claim); err != nil {
+				return "", err
+			}
+			lease, err := reserveStopped(claimDir, id, s.BootstrapParams.Name)
 			if os.IsExist(err) {
+				claim = runnerClaim{}
+				if err := saveRunnerClaim(record, claim); err != nil {
+					return "", err
+				}
 				continue
 			}
 			if err != nil {
 				return "", err
 			}
-			_, writeErr := fmt.Fprintln(f, s.BootstrapParams.Name)
-			syncErr := f.Sync()
-			defer f.Close()
-			if err := lockClaim(f); err != nil {
-				return "", err
-			}
-			if writeErr != nil || syncErr != nil {
-				return "", fmt.Errorf("persist stopped instance claim")
-			}
-			// User data must be replaced while stopped, before publishing ownership to
-			// GARM. A crash leaves a tombstone the keeper safely retires, never reuses.
-			_, err = cli.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{InstanceId: aws.String(id), UserData: &types.SecureBlobAttributeValue{Value: decoded}})
-			if err != nil {
-				return "", fmt.Errorf("set stopped runner user data: %w", err)
-			}
-			tags := []types.Tag{
-				{Key: aws.String("Name"), Value: aws.String(s.BootstrapParams.Name)},
-				{Key: aws.String("GARM_POOL_ID"), Value: aws.String(s.BootstrapParams.PoolID)},
-				{Key: aws.String("OSType"), Value: aws.String(string(s.BootstrapParams.OSType))},
-				{Key: aws.String("OSArch"), Value: aws.String(string(s.BootstrapParams.OSArch))},
-				{Key: aws.String("BFD_STOPPED_POOL"), Value: aws.String("claimed")},
-			}
-			_, err = cli.CreateTags(ctx, &ec2.CreateTagsInput{Resources: []string{id}, Tags: tags})
-			if err != nil {
-				return "", fmt.Errorf("tag stopped runner: %w", err)
-			}
-			_, err = a.client.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{id}})
-			if err != nil {
-				if !isCapacityError(err) {
-					return "", fmt.Errorf("start claimed runner (outcome may be uncertain): %w", err)
-				}
-				// A definitive placement refusal permits a cold launch. Never retry a
-				// possibly successful start by launching a second machine for the job.
-				if stopErr := a.TerminateInstance(ctx, id); stopErr != nil {
-					return "", stopErr
-				}
-				continue
-			}
-			fmt.Fprintf(os.Stderr, "garm-provider-aws: started stopped pool instance %s at %s\n", id, time.Now().UTC().Format(time.RFC3339))
-			return id, nil
+			defer lease.Close()
+			return a.startClaimed(ctx, s, cli, decoded, record, &claim)
+
 		}
 	}
 	return "", nil
+}
+
+// Starting is persisted before StartInstances, so a retry never rewrites the
+// bootstrap of a machine whose start may have succeeded.
+type runnerClaim struct {
+	ID       string `json:"id"`
+	Starting bool   `json:"starting"`
+	Rejected bool   `json:"rejected"`
+}
+
+func saveRunnerClaim(f *os.File, claim runnerClaim) error {
+	data, err := json.Marshal(claim)
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteAt(data, 0); err != nil {
+		return err
+	}
+	if err = f.Truncate(int64(len(data))); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(f.Name()))
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// Publish complete ownership atomically. A crash cannot leave an empty claim
+// file that another process mistakes for a different runner's reservation.
+func reserveStopped(dir, id, name string) (*os.File, error) {
+	path := filepath.Join(dir, id)
+	if f, err := os.OpenFile(path, os.O_RDWR, 0600); err == nil {
+		if err := lockClaim(f); err != nil {
+			f.Close()
+			return nil, err
+		}
+		data, err := io.ReadAll(f)
+		if err != nil || strings.TrimSpace(string(data)) != name {
+			f.Close()
+			if err != nil {
+				return nil, err
+			}
+			return nil, os.ErrExist
+		}
+		return f, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	f, err := os.CreateTemp(dir, ".claim-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(f.Name())
+	if err = lockClaim(f); err == nil {
+		_, err = fmt.Fprintln(f, name)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if err == nil {
+		err = os.Link(f.Name(), path)
+	}
+	if err == nil {
+		err = syncDirectory(dir)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, dir string, record *os.File, claim *runnerClaim) (string, error) {
+	if filepath.Base(claim.ID) != claim.ID {
+		return "", fmt.Errorf("invalid persisted instance ID")
+	}
+	lease, err := reserveStopped(dir, claim.ID, s.BootstrapParams.Name)
+	if os.IsExist(err) {
+		// A crash between persisting the selection and acquiring the reservation.
+		// Nothing was mutated; clear it and let the next retry select another spare.
+		if err := saveRunnerClaim(record, runnerClaim{}); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("selected spare belongs to another runner; retry selection")
+	}
+	if err != nil {
+		return "", err
+	}
+	defer lease.Close()
+	response, err := a.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{claim.ID}})
+	if err != nil {
+		return "", fmt.Errorf("describe claimed runner: %w", err)
+	}
+	for _, reservation := range response.Reservations {
+		for _, instance := range reservation.Instances {
+			if aws.ToString(instance.InstanceId) != claim.ID || instance.State == nil {
+				continue
+			}
+			if tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
+				return "", fmt.Errorf("claimed runner controller mismatch")
+			}
+			switch instance.State.Name {
+			case types.InstanceStateNamePending, types.InstanceStateNameRunning:
+				if tagValue(instance.Tags, "Name") != s.BootstrapParams.Name || tagValue(instance.Tags, "GARM_POOL_ID") != s.BootstrapParams.PoolID {
+					return "", fmt.Errorf("claimed runner ownership not yet visible")
+				}
+				return claim.ID, nil
+			case types.InstanceStateNameStopped:
+				if claim.Rejected {
+					if err := a.TerminateInstance(ctx, claim.ID); err != nil {
+						return "", err
+					}
+					return "", nil
+				}
+				// Ownership tags are published after user data. Recover a lost
+				// CreateTags response without trying to retag a claimed spare.
+				if !claim.Starting && tagValue(instance.Tags, "Name") == s.BootstrapParams.Name && tagValue(instance.Tags, "GARM_POOL_ID") == s.BootstrapParams.PoolID {
+					claim.Starting = true
+					if err := saveRunnerClaim(record, *claim); err != nil {
+						return "", err
+					}
+				}
+				return a.startClaimed(ctx, s, cli, decoded, record, claim)
+			case types.InstanceStateNameTerminated:
+				if claim.Rejected {
+					return "", nil
+				}
+			}
+			return "", fmt.Errorf("claimed runner state %s is not ready", instance.State.Name)
+		}
+	}
+	return "", fmt.Errorf("claimed runner not yet visible")
+}
+
+func (a *AwsCli) startClaimed(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, record *os.File, claim *runnerClaim) (string, error) {
+	id := claim.ID
+	if !claim.Starting {
+		_, err := cli.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{InstanceId: aws.String(id), UserData: &types.SecureBlobAttributeValue{Value: decoded}})
+		if err != nil {
+			return "", fmt.Errorf("set stopped runner user data: %w", err)
+		}
+		tags := []types.Tag{
+			{Key: aws.String("Name"), Value: aws.String(s.BootstrapParams.Name)},
+			{Key: aws.String("GARM_POOL_ID"), Value: aws.String(s.BootstrapParams.PoolID)},
+			{Key: aws.String("OSType"), Value: aws.String(string(s.BootstrapParams.OSType))},
+			{Key: aws.String("OSArch"), Value: aws.String(string(s.BootstrapParams.OSArch))},
+			{Key: aws.String("BFD_STOPPED_POOL"), Value: aws.String("claimed")},
+		}
+		if _, err := cli.CreateTags(ctx, &ec2.CreateTagsInput{Resources: []string{id}, Tags: tags}); err != nil {
+			return "", fmt.Errorf("tag stopped runner: %w", err)
+		}
+		claim.Starting = true
+		if err := saveRunnerClaim(record, *claim); err != nil {
+			return "", err
+		}
+	}
+	if _, err := a.client.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{id}}); err != nil {
+		if !isCapacityError(err) {
+			return "", fmt.Errorf("start claimed runner (outcome may be uncertain): %w", err)
+		}
+		// Confirm termination before allowing cold fallback. A retry recovers the
+		// same reservation even if either the start or termination response is lost.
+		claim.Rejected = true
+		if err := saveRunnerClaim(record, *claim); err != nil {
+			return "", err
+		}
+		if err := a.TerminateInstance(ctx, id); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	fmt.Fprintf(os.Stderr, "garm-provider-aws: started stopped pool instance %s at %s\n", id, time.Now().UTC().Format(time.RFC3339))
+	return id, nil
 }
