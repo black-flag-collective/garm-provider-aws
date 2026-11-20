@@ -66,11 +66,13 @@ fi
 		// the downloaded script before execution, preserving GARM's callbacks.
 		prepare := unitFunction + `# bfd-early-prepare-begin
 bfdWriteEarlyInstall() {
- local script="$1" line count=0
+ local script="$1" line trimmed count=0
   printf '%s\n' '#!/bin/bash' || return 1
   declare -f bfdConfigureEarlyUnit || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
-   if [[ "$line" == *'sudo mv $SVC_NAME /etc/systemd/system/'* ]]; then
+   trimmed="${line#"${line%%[![:space:]]*}"}"
+   trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+   if [[ "$trimmed" == 'sudo mv $SVC_NAME /etc/systemd/system/ || fail "failed to move service file"' ]]; then
     printf '%s\n' 'bfdConfigureEarlyUnit "$SVC_NAME" || exit 1' || return 1
     count=$((count + 1))
    fi

@@ -3,7 +3,6 @@ package spec
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,12 +128,25 @@ func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "sudo"), []byte("#!/bin/bash\n[[ $1 == mv ]] || exit 98\ncp \"$2\" \"$BFD_RESULT\"\n"), 0700))
 	fixture := filepath.Join(dir, "install-fixture.sh")
 	result := filepath.Join(dir, "installed.service")
-	valid := "#!/bin/bash\nset -e\nSVC_NAME=runner.service\nprintf '%s\\n' '[Unit]' 'After=network.target' '[Service]' 'ExecStart=/runner' > \"$SVC_NAME\"\nsudo mv $SVC_NAME /etc/systemd/system/ || exit 1\n"
-	for _, supported := range []bool{true, false} {
-		t.Run(fmt.Sprint(supported), func(t *testing.T) {
-			content := valid
-			if !supported {
-				content = "#!/bin/bash\necho should-not-run > \"$BFD_RESULT\"\n"
+	const install = `sudo mv $SVC_NAME /etc/systemd/system/ || fail "failed to move service file"`
+	prefix := "#!/bin/bash\nset -e\nSVC_NAME=runner.service\nprintf '%s\\n' '[Unit]' 'After=network.target' '[Service]' 'ExecStart=/runner' > \"$SVC_NAME\"\n"
+	for _, tc := range []struct {
+		name      string
+		line      string
+		supported bool
+	}{
+		{"real GARM command", install, true},
+		{"indented GARM command", "\t " + install + " \t", true},
+		{"missing command", "true", false},
+		{"comment", "# " + install, false},
+		{"echoed string", "echo '" + install + "'", false},
+		{"compound line", install + "; echo unsupported", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := prefix + tc.line + "\n"
+			if !tc.supported {
+				// Even commands preceding a lookalike must never execute.
+				content = "#!/bin/bash\necho should-not-run > \"$BFD_RESULT\"\n" + tc.line + "\n"
 			}
 			require.NoError(t, os.WriteFile(fixture, []byte(content), 0700))
 			_ = os.Remove(result)
@@ -142,7 +154,7 @@ func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "BFD_BOOTSTRAP_LOCKED=1", "BFD_FIXTURE="+fixture, "BFD_RESULT="+result)
 			out, err := cmd.CombinedOutput()
-			if !supported {
+			if !tc.supported {
 				require.Error(t, err)
 				require.NoFileExists(t, result)
 				return
