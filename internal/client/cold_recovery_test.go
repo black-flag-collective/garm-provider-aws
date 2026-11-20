@@ -273,3 +273,40 @@ func TestColdRecoveryRechecksLiveOwnershipAndImage(t *testing.T) {
 		}
 	}
 }
+
+func TestColdRecoveryDoesNotDependOnImageLookup(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		t.Run(fmt.Sprint(saved), func(t *testing.T) {
+			cli, m := newCapacityCli(t)
+			cli.cacheDir = t.TempDir()
+			s := capacitySpec(false)
+			s.StoppedPool = "bfd-linux"
+			m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+			var output *ec2.RunInstancesOutput
+			var runErr error
+			if saved {
+				output = &ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}
+			} else {
+				runErr = fmt.Errorf("lost response")
+			}
+			m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return(output, runErr).Once()
+			_, err := cli.CreateRunningInstance(context.Background(), s)
+			if saved {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			require.NoError(t, os.Remove(cli.cachePath("image/"+s.ControllerID+"/"+s.BootstrapParams.Image)))
+			next := new(MockComputeClient)
+			next.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(instanceResponse(testColdInstance()), nil).Once()
+			next.On("DescribeImages", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.DescribeImagesOutput)(nil), fmt.Errorf("AMI deregistered or EC2 lookup unavailable")).Maybe()
+			other := &AwsCli{cfg: cli.cfg, client: next, cacheDir: cli.cacheDir}
+			id, err := other.CreateRunningInstance(context.Background(), s)
+			require.NoError(t, err)
+			require.Equal(t, "i-cold", id)
+			next.AssertNotCalled(t, "DescribeImages", mock.Anything, mock.Anything, mock.Anything)
+			next.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+			next.AssertExpectations(t)
+		})
+	}
+}

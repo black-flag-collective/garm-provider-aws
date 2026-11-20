@@ -205,6 +205,13 @@ func (a *AwsCli) GetInstance(ctx context.Context, instance string) (types.Instan
 // any attached EBS volumes with the DeleteOnTermination block device mapping parameter set to true are
 // automatically deleted.
 func (a *AwsCli) TerminateInstance(ctx context.Context, vmName string) error {
+	if err := a.terminateInstance(ctx, vmName); err != nil {
+		return err
+	}
+	return a.retireRunnerClaim(vmName)
+}
+
+func (a *AwsCli) terminateInstance(ctx context.Context, vmName string) error {
 	_, err := a.client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
 		InstanceIds: []string{vmName},
 	})
@@ -265,7 +272,15 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 
 func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, udata string, record *os.File, claim *runnerClaim) (string, error) {
 	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
-	root_volume := a.cached(imageKey)
+	root_volume := ""
+	if claim != nil && claim.Cold != nil {
+		root_volume = claim.Cold.RootDevice
+		if root_volume == "" {
+			return "", fmt.Errorf("cold recovery record is missing the root device")
+		}
+	} else {
+		root_volume = a.cached(imageKey)
+	}
 	if root_volume == "" {
 		images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
 			Filters: []types.Filter{

@@ -113,13 +113,13 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 			}
 			// Persist the selected instance before reserving it. No EC2 mutation can
 			// happen without this runner's recovery record already on disk.
-			*claim = runnerClaim{ID: id, Plan: s.StoppedPlan(), SpareName: tagValue(instance.Tags, "Name"), BootstrapDigest: fmt.Sprintf("%x", sha256.Sum256(decoded))}
+			*claim = runnerClaim{Generation: claim.Generation, ID: id, Plan: s.StoppedPlan(), SpareName: tagValue(instance.Tags, "Name"), BootstrapDigest: fmt.Sprintf("%x", sha256.Sum256(decoded))}
 			if err := saveRunnerClaim(record, *claim); err != nil {
 				return "", err
 			}
-			lease, err := reserveStopped(claimDir, id, s.BootstrapParams.Name)
+			lease, err := reserveStopped(claimDir, id, reservationOwner(s.BootstrapParams.Name, claim.Generation))
 			if os.IsExist(err) {
-				*claim = runnerClaim{}
+				*claim = runnerClaim{Generation: claim.Generation}
 				if err := saveRunnerClaim(record, *claim); err != nil {
 					return "", err
 				}
@@ -139,6 +139,7 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 // Starting is persisted before StartInstances, so a retry never rewrites the
 // bootstrap of a machine whose start may have succeeded.
 type runnerClaim struct {
+	Generation      string     `json:"generation,omitempty"`
 	ID              string     `json:"id"`
 	Plan            string     `json:"plan,omitempty"`
 	SpareName       string     `json:"spare_name"`
@@ -170,6 +171,11 @@ func saveRunnerClaim(lock *os.File, claim runnerClaim) error {
 	}
 	if err := temp.Close(); err != nil {
 		return err
+	}
+	for _, id := range claimInstanceIDs(claim) {
+		if err := indexRunnerClaim(lock, id); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(temp.Name(), lock.Name()+".json"); err != nil {
 		return err
@@ -235,11 +241,11 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 	if filepath.Base(claim.ID) != claim.ID {
 		return "", fmt.Errorf("invalid persisted instance ID")
 	}
-	lease, err := reserveStopped(dir, claim.ID, s.BootstrapParams.Name)
+	lease, err := reserveStopped(dir, claim.ID, reservationOwner(s.BootstrapParams.Name, claim.Generation))
 	if os.IsExist(err) {
 		// A crash between persisting the selection and acquiring the reservation.
 		// Nothing was mutated; clear it and let the next retry select another spare.
-		if err := saveRunnerClaim(record, runnerClaim{}); err != nil {
+		if err := saveRunnerClaim(record, runnerClaim{Generation: claim.Generation}); err != nil {
 			return "", err
 		}
 		return "", fmt.Errorf("selected spare belongs to another runner; retry selection")
@@ -288,7 +294,7 @@ func (a *AwsCli) reconcileClaimed(ctx context.Context, s *spec.RunnerSpec, cli s
 				return claim.ID, nil
 			case types.InstanceStateNameStopped:
 				if claim.Rejected {
-					if err := a.TerminateInstance(ctx, claim.ID); err != nil {
+					if err := a.terminateInstance(ctx, claim.ID); err != nil {
 						return "", err
 					}
 					return "", nil
@@ -315,6 +321,9 @@ func (a *AwsCli) reconcileClaimed(ctx context.Context, s *spec.RunnerSpec, cli s
 
 func (a *AwsCli) startClaimed(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, record *os.File, claim *runnerClaim) (string, error) {
 	id := claim.ID
+	if err := indexRunnerClaim(record, id); err != nil {
+		return "", err
+	}
 	if !claim.Starting {
 		// EC2 SDK v1.338.1: api_op_ModifyInstanceAttribute.go:159 requires SecureBlobAttributeValue, defined in types/types.go:21669.
 		_, err := cli.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{InstanceId: aws.String(id), UserData: &types.SecureBlobAttributeValue{Value: decoded}})
@@ -346,11 +355,18 @@ func (a *AwsCli) startClaimed(ctx context.Context, s *spec.RunnerSpec, cli stopp
 		if err := saveRunnerClaim(record, *claim); err != nil {
 			return "", err
 		}
-		if err := a.TerminateInstance(ctx, id); err != nil {
+		if err := a.terminateInstance(ctx, id); err != nil {
 			return "", err
 		}
 		return "", nil
 	}
 	fmt.Fprintf(os.Stderr, "garm-provider-aws: started stopped pool instance %s at %s\n", id, time.Now().UTC().Format(time.RFC3339))
 	return id, nil
+}
+
+func reservationOwner(name, generation string) string {
+	if generation == "" {
+		return name
+	}
+	return name + "/" + generation
 }

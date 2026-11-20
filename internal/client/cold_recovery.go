@@ -18,16 +18,20 @@ import (
 // idempotency token and resulting instance ID. The per-runner lock covers both
 // the reserve and cold-launch paths.
 type coldClaim struct {
-	Attempt spec.LaunchAttempt `json:"attempt"`
-	Token   string             `json:"token"`
-	Digest  string             `json:"digest"`
-	Plan    string             `json:"plan"`
-	Created time.Time          `json:"created"`
-	ID      string             `json:"id,omitempty"`
+	Attempt    spec.LaunchAttempt `json:"attempt"`
+	Token      string             `json:"token"`
+	Digest     string             `json:"digest"`
+	Plan       string             `json:"plan"`
+	Created    time.Time          `json:"created"`
+	ID         string             `json:"id,omitempty"`
+	RootDevice string             `json:"root_device"`
 }
 
 func prepareCold(record *os.File, claim *runnerClaim, s *spec.RunnerSpec, attempt spec.LaunchAttempt, input *ec2.RunInstancesInput) error {
 	key := fmt.Sprintf("%s/%s/%s/%t/%s/%s", s.ControllerID, s.BootstrapParams.PoolID, s.BootstrapParams.Name, attempt.Spot, attempt.Flavor, attempt.SubnetID)
+	if claim.Generation != "" {
+		key += "/" + claim.Generation
+	}
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
 	input.ClientToken = aws.String(token)
 	encoded, err := json.Marshal(input)
@@ -41,7 +45,7 @@ func prepareCold(record *os.File, claim *runnerClaim, s *spec.RunnerSpec, attemp
 		}
 		return nil
 	}
-	claim.Cold = &coldClaim{Attempt: attempt, Token: token, Digest: digest, Plan: s.StoppedPlan(), Created: time.Now().UTC()}
+	claim.Cold = &coldClaim{Attempt: attempt, Token: token, Digest: digest, Plan: s.StoppedPlan(), RootDevice: aws.ToString(input.BlockDeviceMappings[0].DeviceName), Created: time.Now().UTC()}
 	return saveRunnerClaim(record, *claim)
 }
 

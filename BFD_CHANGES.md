@@ -61,7 +61,11 @@ contain no bootstrap data. Resumed reserves must still match the requested
 plan, image, bootstrap digest and ownership. Cold recovery checks the current
 request digest before token lookup, saved-ID recovery or replay, and rechecks
 live ownership before returning any recovered instance. Named IAM profiles are fingerprinted distinctly from ARNs and
-from other names, using the same encoding as the keeper.
+from other names, using the same encoding as the keeper. Recovery uses the saved
+root device without another AMI lookup. Successful runner deletion retires its
+active record under the permanent lock and rotates its launch/reservation
+generation. Instance tombstones remain one-use; delayed deletion of an older
+instance cannot clear a replacement runner's record.
 
 The keeper and provider match a SHA-256 fingerprint of the image, allowed
 placements, security groups, instance profile and disk configuration. Reserve

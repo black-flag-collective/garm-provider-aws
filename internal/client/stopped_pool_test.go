@@ -35,7 +35,13 @@ func TestStoppedClaimConcurrentOneUse(t *testing.T) {
 		return tagValue(in.Tags, "GARM_POOL_ID") == s.BootstrapParams.PoolID && tagValue(in.Tags, "BFD_STOPPED_POOL") == "claimed"
 	}), mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once().NotBefore(modify)
 	m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.StartInstancesOutput{}, nil).Once().NotBefore(tags)
-	m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}, nil).Times(12)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("runner-%d", i)
+		m.On("RunInstances", mock.Anything, mock.MatchedBy(func(in *ec2.RunInstancesInput) bool { return tagValue(in.TagSpecifications[0].Tags, "Name") == name }), mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String(fmt.Sprintf("i-cold-%d", i))}}}, nil).Maybe()
+	}
+	m.On("RunInstances", mock.Anything, mock.MatchedBy(func(in *ec2.RunInstancesInput) bool {
+		return tagValue(in.TagSpecifications[0].Tags, "Name") == "runner"
+	}), mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}, nil).Once()
 	var wg sync.WaitGroup
 	var claimed atomic.Int32
 	for i := 0; i < 12; i++ {
