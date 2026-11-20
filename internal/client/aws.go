@@ -19,8 +19,11 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -39,12 +42,22 @@ func NewAwsCli(ctx context.Context, cfg *config.Config) (*AwsCli, error) {
 		return nil, fmt.Errorf("failed to get AWS cli context: %w", err)
 	}
 
-	client := ec2.NewFromConfig(cliCfg)
+	client := ec2.NewFromConfig(cliCfg, func(o *ec2.Options) {
+		if o.Retryer == nil {
+			o.Retryer = retry.NewStandard()
+		}
+		o.Retryer = placementRetryer{o.Retryer}
+	})
 	awsCli := &AwsCli{
 		cfg:    cfg,
 		client: client,
 	}
 
+	if cfg.CacheDir != "" {
+		awsCli.cacheDir = cfg.CacheDir
+	} else if dir, err := os.UserCacheDir(); err == nil {
+		awsCli.cacheDir = filepath.Join(dir, "garm-provider-aws")
+	}
 	return awsCli, nil
 }
 
@@ -60,7 +73,8 @@ type ClientInterface interface {
 type AwsCli struct {
 	cfg *config.Config
 
-	client ClientInterface
+	client   ClientInterface
+	cacheDir string
 }
 
 func (a *AwsCli) Config() *config.Config {
@@ -247,27 +261,32 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		return "", fmt.Errorf("failed to compose user data: %w", err)
 	}
 
-	images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Filters: []types.Filter{
-			{
-				Name:   aws.String("image-id"),
-				Values: []string{spec.BootstrapParams.Image},
+	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
+	root_volume := a.cached(imageKey)
+	if root_volume == "" {
+		images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
+			Filters: []types.Filter{
+				{
+					Name:   aws.String("image-id"),
+					Values: []string{spec.BootstrapParams.Image},
+				},
 			},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to query AMI root volume: %w", err)
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to query AMI root volume: %w", err)
+		}
+		if len(images.Images) != 1 {
+			return "", fmt.Errorf("failed to query AMI root volume: AMI %s not found", spec.BootstrapParams.Image)
+		}
+		if images.Images[0].RootDeviceName == nil {
+			return "", fmt.Errorf("failed to query AMI root volume: root device is nil")
+		}
+		root_volume = *images.Images[0].RootDeviceName
+		a.remember(imageKey, root_volume, time.Hour)
 	}
-	if len(images.Images) != 1 {
-		return "", fmt.Errorf("failed to query AMI root volume: AMI %s not found", spec.BootstrapParams.Image)
-	}
-	if images.Images[0].RootDeviceName == nil {
-		return "", fmt.Errorf("failed to query AMI root volume: root device is nil")
-	}
-	root_volume := *images.Images[0].RootDeviceName
 
 	var lastErr error
-	for _, attempt := range spec.LaunchAttempts() {
+	for _, attempt := range a.launchAttempts(spec) {
 		var subnetID *string
 		if attempt.SubnetID != "" {
 			subnetID = aws.String(attempt.SubnetID)
@@ -342,6 +361,7 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		if !isCapacityError(err) {
 			return "", fmt.Errorf("failed to create instance: %w", err)
 		}
+		a.remember(placementKey(spec, attempt), "refused", 3*time.Minute)
 		market := "on-demand"
 		if attempt.Spot {
 			market = "spot"

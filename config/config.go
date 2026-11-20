@@ -46,6 +46,7 @@ func NewConfig(cfgFile string) (*Config, error) {
 }
 
 type Config struct {
+	CacheDir    string      `toml:"cache_dir"`
 	Credentials Credentials `toml:"credentials"`
 	SubnetID    string      `toml:"subnet_id"`
 	Region      string      `toml:"region"`
