@@ -100,7 +100,7 @@ func TestStartFailureOnlyFallsBackWhenOutcomeIsDefinitive(t *testing.T) {
 				{Key: aws.String("BFD_STOPPED_POOL"), Value: aws.String(s.StoppedPool)},
 				{Key: aws.String("BFD_STOPPED_PLAN"), Value: aws.String(s.StoppedPlan())},
 			}}
-			m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}}}, nil)
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}}}, nil)
 			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 			var startErr error = fmt.Errorf("transport timeout: outcome unknown")
@@ -114,6 +114,7 @@ func TestStartFailureOnlyFallsBackWhenOutcomeIsDefinitive(t *testing.T) {
 			if capacity {
 				require.NoError(t, err)
 				require.Equal(t, "i-cold", id)
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(testColdInstance()), nil).Once()
 				other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
 				recovered, err := other.CreateRunningInstance(context.Background(), s)
 				require.NoError(t, err)
@@ -341,4 +342,76 @@ func TestClaimStateUsesAtomicReplacementAndStableLock(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
+}
+
+func TestResumeOwnershipChecksApplyBeforeEveryStateAction(t *testing.T) {
+	for _, state := range []types.InstanceStateName{types.InstanceStateNameStopped, types.InstanceStateNamePending, types.InstanceStateNameRunning, types.InstanceStateNameTerminated} {
+		for _, changed := range []string{"pool", "name"} {
+			t.Run(string(state)+"/"+changed, func(t *testing.T) {
+				cli, m := newCapacityCli(t)
+				m.ExpectedCalls[0].Maybe()
+				cli.cacheDir = t.TempDir()
+				s := capacitySpec(false)
+				s.StoppedPool = "bfd-linux"
+				candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+				m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
+				m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
+				m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost response")).Once()
+				_, err := cli.CreateRunningInstance(context.Background(), s)
+				require.Error(t, err)
+				pool, name := s.BootstrapParams.PoolID, s.BootstrapParams.Name
+				if changed == "pool" {
+					pool = "another-pool"
+				} else {
+					name = "another-runner"
+				}
+				candidate.State = &types.InstanceState{Name: state}
+				candidate.Tags = append(candidate.Tags, types.Tag{Key: aws.String("GARM_POOL_ID"), Value: aws.String(pool)}, types.Tag{Key: aws.String("Name"), Value: aws.String(name)})
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+				other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+				_, err = other.CreateRunningInstance(context.Background(), s)
+				require.ErrorContains(t, err, "ownership mismatch")
+				m.AssertNotCalled(t, "TerminateInstances", mock.Anything, mock.Anything, mock.Anything)
+				m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+				m.AssertExpectations(t)
+			})
+		}
+	}
+}
+
+func TestRetryBeforeTaggingRequiresOriginalSpareName(t *testing.T) {
+	for _, renamed := range []bool{false, true} {
+		t.Run(fmt.Sprint(renamed), func(t *testing.T) {
+			cli, m := newCapacityCli(t)
+			m.ExpectedCalls[0].Maybe()
+			cli.cacheDir = t.TempDir()
+			s := capacitySpec(false)
+			s.StoppedPool = "bfd-linux"
+			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
+			candidate.Tags = append(candidate.Tags, types.Tag{Key: aws.String("Name"), Value: aws.String("bfd-spare-original")})
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			first := m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.ModifyInstanceAttributeOutput)(nil), fmt.Errorf("lost response")).Once()
+			_, err := cli.CreateRunningInstance(context.Background(), s)
+			require.Error(t, err)
+			if renamed {
+				candidate.Tags[len(candidate.Tags)-1].Value = aws.String("another-runner")
+			} else {
+				m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once().NotBefore(first)
+				m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
+				m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.StartInstancesOutput{}, nil).Once()
+			}
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+			id, err := other.CreateRunningInstance(context.Background(), s)
+			if renamed {
+				require.ErrorContains(t, err, "ownership mismatch")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "i-claim", id)
+			}
+			m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+			m.AssertExpectations(t)
+		})
+	}
 }

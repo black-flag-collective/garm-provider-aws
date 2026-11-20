@@ -264,14 +264,6 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 }
 
 func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, udata string, record *os.File, claim *runnerClaim) (string, error) {
-	if claim != nil && claim.Cold != nil && claim.Cold.ID != "" {
-		return claim.Cold.ID, nil
-	}
-	if claim != nil && claim.Cold != nil {
-		if id, err := a.recoverCold(ctx, spec, record, claim); id != "" || err != nil {
-			return id, err
-		}
-	}
 	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
 	root_volume := a.cached(imageKey)
 	if root_volume == "" {
@@ -374,8 +366,16 @@ func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, 
 			}
 		}
 		if claim != nil {
+			recovering := claim.Cold != nil
 			if err := prepareCold(record, claim, spec, attempt, input); err != nil {
 				return "", err
+			}
+			// Validate the current request before every recovery path, including
+			// a saved successful ID. A token lookup cannot bypass this check.
+			if recovering {
+				if id, err := a.recoverCold(ctx, spec, record, claim); id != "" || err != nil {
+					return id, err
+				}
 			}
 		}
 		resp, err := a.client.RunInstances(ctx, input, func(o *ec2.Options) {

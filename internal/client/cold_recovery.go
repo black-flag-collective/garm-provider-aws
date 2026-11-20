@@ -21,6 +21,7 @@ type coldClaim struct {
 	Attempt spec.LaunchAttempt `json:"attempt"`
 	Token   string             `json:"token"`
 	Digest  string             `json:"digest"`
+	Plan    string             `json:"plan"`
 	Created time.Time          `json:"created"`
 	ID      string             `json:"id,omitempty"`
 }
@@ -35,20 +36,24 @@ func prepareCold(record *os.File, claim *runnerClaim, s *spec.RunnerSpec, attemp
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256(encoded))
 	if claim.Cold != nil {
-		if claim.Cold.Token != token || claim.Cold.Digest != digest {
-			return fmt.Errorf("cold launch parameters changed while its outcome is uncertain")
+		if claim.Cold.Token != token || claim.Cold.Digest != digest || claim.Cold.Plan != s.StoppedPlan() {
+			return fmt.Errorf("cold launch parameters changed from the recorded request")
 		}
 		return nil
 	}
-	claim.Cold = &coldClaim{Attempt: attempt, Token: token, Digest: digest, Created: time.Now().UTC()}
+	claim.Cold = &coldClaim{Attempt: attempt, Token: token, Digest: digest, Plan: s.StoppedPlan(), Created: time.Now().UTC()}
 	return saveRunnerClaim(record, *claim)
 }
 
 func (a *AwsCli) recoverCold(ctx context.Context, s *spec.RunnerSpec, record *os.File, claim *runnerClaim) (string, error) {
-	response, err := a.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
+	input := &ec2.DescribeInstancesInput{Filters: []types.Filter{
 		{Name: aws.String("client-token"), Values: []string{claim.Cold.Token}},
 		{Name: aws.String("tag:GARM_CONTROLLER_ID"), Values: []string{s.ControllerID}},
-	}})
+	}}
+	if claim.Cold.ID != "" {
+		input.InstanceIds = []string{claim.Cold.ID}
+	}
+	response, err := a.client.DescribeInstances(ctx, input)
 	if err != nil {
 		return "", fmt.Errorf("recover cold runner: %w", err)
 	}
@@ -64,6 +69,12 @@ func (a *AwsCli) recoverCold(ctx context.Context, s *spec.RunnerSpec, record *os
 		if aws.ToString(instance.ClientToken) != claim.Cold.Token || tagValue(instance.Tags, "Name") != s.BootstrapParams.Name || tagValue(instance.Tags, "GARM_POOL_ID") != s.BootstrapParams.PoolID || tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
 			return "", fmt.Errorf("cold runner ownership not yet visible")
 		}
+		if aws.ToString(instance.ImageId) != s.BootstrapParams.Image {
+			return "", fmt.Errorf("cold runner does not match requested image")
+		}
+		if claim.Cold.ID != "" && aws.ToString(instance.InstanceId) != claim.Cold.ID {
+			return "", fmt.Errorf("cold runner ID mismatch")
+		}
 		if instance.State == nil || (instance.State.Name != types.InstanceStateNamePending && instance.State.Name != types.InstanceStateNameRunning) {
 			return "", fmt.Errorf("cold runner is no longer starting or running")
 		}
@@ -76,6 +87,9 @@ func (a *AwsCli) recoverCold(ctx context.Context, s *spec.RunnerSpec, record *os
 			return "", err
 		}
 		return id, nil
+	}
+	if claim.Cold.ID != "" {
+		return "", fmt.Errorf("recorded cold runner not yet visible")
 	}
 	// EC2 idempotency tokens have a bounded lifetime. Never replay an old unknown
 	// result after the retention window; a later Describe can still recover it.

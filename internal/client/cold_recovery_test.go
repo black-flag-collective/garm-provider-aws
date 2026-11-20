@@ -24,7 +24,8 @@ func TestConcurrentEmptyPoolCreatesLaunchOneColdInstance(t *testing.T) {
 	cli.cacheDir = t.TempDir()
 	s := capacitySpec(false)
 	s.StoppedPool = "bfd-linux"
-	m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(testColdInstance()), nil).Times(11)
 	m.On("RunInstances", mock.Anything, mock.MatchedBy(func(in *ec2.RunInstancesInput) bool { return len(aws.ToString(in.ClientToken)) == 64 }), mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}, nil).Once()
 	var wg sync.WaitGroup
 	for i := 0; i < 12; i++ {
@@ -64,20 +65,18 @@ func TestUncertainColdFallbackRecoversOrReplaysSamePlacement(t *testing.T) {
 			require.NotEmpty(t, aws.ToString(original.ClientToken))
 			response := &ec2.DescribeInstancesOutput{}
 			if visible {
-				response = instanceResponse(types.Instance{InstanceId: aws.String("i-cold"), ClientToken: original.ClientToken, State: &types.InstanceState{Name: types.InstanceStateNamePending}, Tags: original.TagSpecifications[0].Tags})
-				// Updated bootstrap credentials do not prevent recovering an already
-				// accepted launch by its persisted token.
-				s.BootstrapParams.InstanceToken = "updated-jit-secret"
+				response = instanceResponse(types.Instance{InstanceId: aws.String("i-cold"), ClientToken: original.ClientToken, ImageId: original.ImageId, State: &types.InstanceState{Name: types.InstanceStateNamePending}, Tags: original.TagSpecifications[0].Tags})
 			} else {
 				m.On("RunInstances", mock.Anything, mock.MatchedBy(func(in *ec2.RunInstancesInput) bool {
 					return aws.ToString(in.ClientToken) == aws.ToString(original.ClientToken) && aws.ToString(in.SubnetId) == aws.ToString(original.SubnetId) && in.InstanceType == original.InstanceType && aws.ToString(in.UserData) == aws.ToString(original.UserData)
 				}), mock.Anything).Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}, nil).Once().NotBefore(first)
 			}
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
-				return len(in.Filters) > 0 && aws.ToString(in.Filters[0].Name) == "client-token" && in.Filters[0].Values[0] == aws.ToString(original.ClientToken)
+				return len(in.InstanceIds) == 0 && len(in.Filters) > 0 && aws.ToString(in.Filters[0].Name) == "client-token" && in.Filters[0].Values[0] == aws.ToString(original.ClientToken)
 			}), mock.Anything).Return(response, nil).Once()
-			// A newly preferred subnet must not change an uncertain request's placement.
-			s.SubnetID, s.FallbackSubnets[0] = s.FallbackSubnets[0], s.SubnetID
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 1 }), mock.Anything).Return(instanceResponse(testColdInstance()), nil).Once()
+			// Capacity-cache ordering must not change an uncertain request.
+			cli.remember(placementKey(s, s.LaunchAttempts()[0]), "refused", time.Minute)
 			other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
 			id, err := other.CreateRunningInstance(context.Background(), s)
 			require.NoError(t, err)
@@ -106,7 +105,11 @@ func TestUnknownColdOutcomeNeverChangesRequestOrReplaysExpiredToken(t *testing.T
 			cli.cacheDir = t.TempDir()
 			s := capacitySpec(false)
 			s.StoppedPool = "bfd-linux"
-			m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Twice()
+			calls := 1
+			if expired {
+				calls = 2
+			}
+			m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Times(calls)
 			m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.RunInstancesOutput)(nil), fmt.Errorf("response lost")).Once()
 			_, err := cli.CreateRunningInstance(context.Background(), s)
 			require.Error(t, err)
@@ -152,7 +155,7 @@ func TestColdRecoveryRejectsMultipleTokenMatches(t *testing.T) {
 	m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) { original = args.Get(1).(*ec2.RunInstancesInput) }).Return((*ec2.RunInstancesOutput)(nil), fmt.Errorf("response lost")).Once()
 	_, err := cli.CreateRunningInstance(context.Background(), s)
 	require.Error(t, err)
-	candidate := types.Instance{InstanceId: aws.String("i-first"), ClientToken: original.ClientToken, State: &types.InstanceState{Name: types.InstanceStateNamePending}, Tags: original.TagSpecifications[0].Tags}
+	candidate := types.Instance{InstanceId: aws.String("i-first"), ClientToken: original.ClientToken, ImageId: original.ImageId, State: &types.InstanceState{Name: types.InstanceStateNamePending}, Tags: original.TagSpecifications[0].Tags}
 	second := candidate
 	second.InstanceId = aws.String("i-second")
 	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return aws.ToString(in.Filters[0].Name) == "client-token" }), mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}, {Instances: []types.Instance{second}}}}, nil).Once()
@@ -160,4 +163,112 @@ func TestColdRecoveryRejectsMultipleTokenMatches(t *testing.T) {
 	_, err = other.CreateRunningInstance(context.Background(), s)
 	require.ErrorContains(t, err, "multiple instances")
 	m.AssertExpectations(t)
+}
+
+func testColdInstance() types.Instance {
+	return types.Instance{InstanceId: aws.String("i-cold"), ImageId: aws.String("ami-12345678"), ClientToken: aws.String("ecab906ed5c03b755208eb2a18235c7cfb7c4a124d00c74879c0e63e92b82580"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, Tags: []types.Tag{
+		{Key: aws.String("GARM_CONTROLLER_ID"), Value: aws.String("controller")},
+		{Key: aws.String("GARM_POOL_ID"), Value: aws.String("pool")},
+		{Key: aws.String("Name"), Value: aws.String("runner")},
+	}}
+}
+
+func TestEveryColdRecoveryPathRejectsChangedParameters(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		for _, change := range []string{"image", "profile", "bootstrap", "placements"} {
+			t.Run(fmt.Sprintf("saved=%t/%s", saved, change), func(t *testing.T) {
+				cli, m := newCapacityCli(t)
+				m.ExpectedCalls[0].Maybe()
+				cli.cacheDir = t.TempDir()
+				s := capacitySpec(false)
+				s.StoppedPool = "bfd-linux"
+				m.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+				var runErr error
+				var output *ec2.RunInstancesOutput
+				if saved {
+					output = &ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}
+				} else {
+					runErr = fmt.Errorf("lost response")
+				}
+				m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return(output, runErr).Once()
+				_, err := cli.CreateRunningInstance(context.Background(), s)
+				if saved {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+				switch change {
+				case "image":
+					s.BootstrapParams.Image = "ami-new"
+				case "profile":
+					s.IAMInstanceProfile = &types.IamInstanceProfileSpecification{Name: aws.String("different-profile")}
+				case "bootstrap":
+					s.BootstrapParams.InstanceToken = "new-token"
+				case "placements":
+					s.FallbackSubnets = append(s.FallbackSubnets, "subnet-cccccccc")
+				}
+				other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+				_, err = other.CreateRunningInstance(context.Background(), s)
+				require.ErrorContains(t, err, "parameters changed")
+				// No token lookup or saved-ID fast return may bypass the request check.
+				m.AssertExpectations(t)
+			})
+		}
+	}
+}
+
+func TestColdRecoveryRechecksLiveOwnershipAndImage(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		for _, change := range []string{"pool", "name", "controller", "image", "missing"} {
+			if !saved && change == "missing" {
+				continue
+			} // Unknown requests may replay.
+			t.Run(fmt.Sprintf("saved=%t/%s", saved, change), func(t *testing.T) {
+				cli, m := newCapacityCli(t)
+				m.ExpectedCalls[0].Maybe()
+				cli.cacheDir = t.TempDir()
+				s := capacitySpec(false)
+				s.StoppedPool = "bfd-linux"
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
+					return len(in.Filters) > 0 && aws.ToString(in.Filters[0].Name) == "tag:GARM_CONTROLLER_ID"
+				}), mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+				var runErr error
+				var output *ec2.RunInstancesOutput
+				if saved {
+					output = &ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-cold")}}}
+				} else {
+					runErr = fmt.Errorf("lost response")
+				}
+				m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Return(output, runErr).Once()
+				_, err := cli.CreateRunningInstance(context.Background(), s)
+				if saved {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+				instance := testColdInstance()
+				switch change {
+				case "pool":
+					instance.Tags[1].Value = aws.String("other-pool")
+				case "name":
+					instance.Tags[2].Value = aws.String("other-runner")
+				case "controller":
+					instance.Tags[0].Value = aws.String("other-controller")
+				case "image":
+					instance.ImageId = aws.String("ami-other")
+				}
+				response := instanceResponse(instance)
+				if change == "missing" {
+					response = &ec2.DescribeInstancesOutput{}
+				}
+				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
+					return len(in.Filters) > 0 && aws.ToString(in.Filters[0].Name) == "client-token"
+				}), mock.Anything).Return(response, nil).Once()
+				other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+				_, err = other.CreateRunningInstance(context.Background(), s)
+				require.Error(t, err)
+				m.AssertExpectations(t)
+			})
+		}
+	}
 }

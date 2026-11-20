@@ -58,7 +58,9 @@ A lost RunInstances response is recovered by token lookup or an identical replay
 in the original placement; changed parameters or expired uncertain requests fail
 closed. Claim JSON is atomically replaced under a separate permanent lock; records
 contain no bootstrap data. Resumed reserves must still match the requested
-plan and image. Named IAM profiles are fingerprinted distinctly from ARNs and
+plan, image, bootstrap digest and ownership. Cold recovery checks the current
+request digest before token lookup, saved-ID recovery or replay, and rechecks
+live ownership before returning any recovered instance. Named IAM profiles are fingerprinted distinctly from ARNs and
 from other names, using the same encoding as the keeper.
 
 The keeper and provider match a SHA-256 fingerprint of the image, allowed

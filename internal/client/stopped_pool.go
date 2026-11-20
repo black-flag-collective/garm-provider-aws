@@ -113,7 +113,7 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 			}
 			// Persist the selected instance before reserving it. No EC2 mutation can
 			// happen without this runner's recovery record already on disk.
-			*claim = runnerClaim{ID: id, Plan: s.StoppedPlan()}
+			*claim = runnerClaim{ID: id, Plan: s.StoppedPlan(), SpareName: tagValue(instance.Tags, "Name"), BootstrapDigest: fmt.Sprintf("%x", sha256.Sum256(decoded))}
 			if err := saveRunnerClaim(record, *claim); err != nil {
 				return "", err
 			}
@@ -139,11 +139,13 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 // Starting is persisted before StartInstances, so a retry never rewrites the
 // bootstrap of a machine whose start may have succeeded.
 type runnerClaim struct {
-	ID       string     `json:"id"`
-	Plan     string     `json:"plan,omitempty"`
-	Starting bool       `json:"starting"`
-	Rejected bool       `json:"rejected"`
-	Cold     *coldClaim `json:"cold,omitempty"`
+	ID              string     `json:"id"`
+	Plan            string     `json:"plan,omitempty"`
+	SpareName       string     `json:"spare_name"`
+	BootstrapDigest string     `json:"bootstrap_digest"`
+	Starting        bool       `json:"starting"`
+	Rejected        bool       `json:"rejected"`
+	Cold            *coldClaim `json:"cold,omitempty"`
 }
 
 // The lock inode is permanent. State is replaced atomically beside it, so
@@ -233,6 +235,9 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 	if claim.Plan != s.StoppedPlan() {
 		return "", fmt.Errorf("persisted stopped claim does not match requested plan")
 	}
+	if claim.BootstrapDigest != fmt.Sprintf("%x", sha256.Sum256(decoded)) {
+		return "", fmt.Errorf("stopped runner bootstrap parameters changed")
+	}
 	if filepath.Base(claim.ID) != claim.ID {
 		return "", fmt.Errorf("invalid persisted instance ID")
 	}
@@ -264,9 +269,14 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 			if aws.ToString(instance.ImageId) != s.BootstrapParams.Image || tagValue(instance.Tags, "BFD_STOPPED_PLAN") != claim.Plan {
 				return "", fmt.Errorf("claimed runner does not match requested plan")
 			}
+			owned := tagValue(instance.Tags, "GARM_POOL_ID") == s.BootstrapParams.PoolID && tagValue(instance.Tags, "Name") == s.BootstrapParams.Name
+			unclaimed := !claim.Starting && !claim.Rejected && tagValue(instance.Tags, "GARM_POOL_ID") == "" && tagValue(instance.Tags, "Name") == claim.SpareName && tagValue(instance.Tags, "BFD_STOPPED_POOL") == s.StoppedPool
+			if !owned && !unclaimed {
+				return "", fmt.Errorf("claimed runner ownership mismatch")
+			}
 			switch instance.State.Name {
 			case types.InstanceStateNamePending, types.InstanceStateNameRunning:
-				if tagValue(instance.Tags, "Name") != s.BootstrapParams.Name || tagValue(instance.Tags, "GARM_POOL_ID") != s.BootstrapParams.PoolID {
+				if !owned {
 					return "", fmt.Errorf("claimed runner ownership not yet visible")
 				}
 				return claim.ID, nil
@@ -279,7 +289,7 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 				}
 				// Ownership tags are published after user data. Recover a lost
 				// CreateTags response without trying to retag a claimed spare.
-				if !claim.Starting && tagValue(instance.Tags, "Name") == s.BootstrapParams.Name && tagValue(instance.Tags, "GARM_POOL_ID") == s.BootstrapParams.PoolID {
+				if !claim.Starting && owned {
 					claim.Starting = true
 					if err := saveRunnerClaim(record, *claim); err != nil {
 						return "", err
