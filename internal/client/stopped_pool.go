@@ -129,7 +129,7 @@ func (a *AwsCli) findStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppe
 				return "", err
 			}
 			defer lease.Close()
-			return a.startClaimed(ctx, s, cli, decoded, record, claim)
+			return a.reconcileClaimed(ctx, s, cli, decoded, record, claim)
 
 		}
 	}
@@ -232,12 +232,6 @@ func reserveStopped(dir, id, name string) (*os.File, error) {
 }
 
 func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, dir string, record *os.File, claim *runnerClaim) (string, error) {
-	if claim.Plan != s.StoppedPlan() {
-		return "", fmt.Errorf("persisted stopped claim does not match requested plan")
-	}
-	if claim.BootstrapDigest != fmt.Sprintf("%x", sha256.Sum256(decoded)) {
-		return "", fmt.Errorf("stopped runner bootstrap parameters changed")
-	}
 	if filepath.Base(claim.ID) != claim.ID {
 		return "", fmt.Errorf("invalid persisted instance ID")
 	}
@@ -254,6 +248,18 @@ func (a *AwsCli) resumeStopped(ctx context.Context, s *spec.RunnerSpec, cli stop
 		return "", err
 	}
 	defer lease.Close()
+	return a.reconcileClaimed(ctx, s, cli, decoded, record, claim)
+}
+
+// Both first claims and retries re-read the instance under its reservation lock.
+// Inventory is only a candidate list; it cannot authorize mutations or starts.
+func (a *AwsCli) reconcileClaimed(ctx context.Context, s *spec.RunnerSpec, cli stoppedClient, decoded []byte, record *os.File, claim *runnerClaim) (string, error) {
+	if claim.Plan != s.StoppedPlan() {
+		return "", fmt.Errorf("persisted stopped claim does not match requested plan")
+	}
+	if claim.BootstrapDigest != fmt.Sprintf("%x", sha256.Sum256(decoded)) {
+		return "", fmt.Errorf("stopped runner bootstrap parameters changed")
+	}
 	response, err := a.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{claim.ID}})
 	if err != nil {
 		return "", fmt.Errorf("describe claimed runner: %w", err)

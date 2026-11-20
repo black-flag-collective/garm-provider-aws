@@ -101,6 +101,7 @@ func TestStartFailureOnlyFallsBackWhenOutcomeIsDefinitive(t *testing.T) {
 				{Key: aws.String("BFD_STOPPED_PLAN"), Value: aws.String(s.StoppedPlan())},
 			}}
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}}}, nil)
+			expectInitialClaimLookup(m, candidate)
 			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 			var startErr error = fmt.Errorf("transport timeout: outcome unknown")
@@ -138,6 +139,7 @@ func TestSameRunnerConcurrentCreatesResumeOneClaim(t *testing.T) {
 	s.StoppedPool = "bfd-linux"
 	candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+	expectInitialClaimLookup(m, candidate)
 	running := candidate
 	running.State = &types.InstanceState{Name: types.InstanceStateNameRunning}
 	running.Tags = append(append([]types.Tag{}, candidate.Tags...), types.Tag{Key: aws.String("Name"), Value: aws.String(s.BootstrapParams.Name)}, types.Tag{Key: aws.String("GARM_POOL_ID"), Value: aws.String(s.BootstrapParams.PoolID)})
@@ -187,6 +189,7 @@ func TestAmbiguousStartRetryRecoversActualInstance(t *testing.T) {
 			s.StoppedPool = "bfd-linux"
 			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			expectInitialClaimLookup(m, candidate)
 			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 			first := m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost start response")).Once()
@@ -234,6 +237,7 @@ func TestLostTagResponseResumesWithoutRewritingClaimedSpare(t *testing.T) {
 	s.StoppedPool = "bfd-linux"
 	candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+	expectInitialClaimLookup(m, candidate)
 	m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 	m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.CreateTagsOutput)(nil), fmt.Errorf("lost tag response")).Once()
 	_, err := cli.CreateRunningInstance(context.Background(), s)
@@ -257,6 +261,7 @@ func TestUnknownClaimStateNeverFallsBack(t *testing.T) {
 	s.StoppedPool = "bfd-linux"
 	candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+	expectInitialClaimLookup(m, candidate)
 	m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 	m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 	m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost response")).Once()
@@ -280,6 +285,7 @@ func TestResumedClaimRejectsChangedPlan(t *testing.T) {
 			s.StoppedPool = "bfd-linux"
 			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			expectInitialClaimLookup(m, candidate)
 			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 			m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost response")).Once()
@@ -355,6 +361,7 @@ func TestResumeOwnershipChecksApplyBeforeEveryStateAction(t *testing.T) {
 				s.StoppedPool = "bfd-linux"
 				candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 				m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+				expectInitialClaimLookup(m, candidate)
 				m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 				m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 				m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), fmt.Errorf("lost response")).Once()
@@ -391,6 +398,7 @@ func TestRetryBeforeTaggingRequiresOriginalSpareName(t *testing.T) {
 			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
 			candidate.Tags = append(candidate.Tags, types.Tag{Key: aws.String("Name"), Value: aws.String("bfd-spare-original")})
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			expectInitialClaimLookup(m, candidate)
 			first := m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.ModifyInstanceAttributeOutput)(nil), fmt.Errorf("lost response")).Once()
 			_, err := cli.CreateRunningInstance(context.Background(), s)
 			require.Error(t, err)
@@ -411,6 +419,62 @@ func TestRetryBeforeTaggingRequiresOriginalSpareName(t *testing.T) {
 				require.Equal(t, "i-claim", id)
 			}
 			m.AssertNotCalled(t, "RunInstances", mock.Anything, mock.Anything, mock.Anything)
+			m.AssertExpectations(t)
+		})
+	}
+}
+
+func expectInitialClaimLookup(m *MockComputeClient, candidate types.Instance) {
+	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
+		return len(in.InstanceIds) == 1 && in.InstanceIds[0] == aws.ToString(candidate.InstanceId)
+	}), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+}
+
+func TestFirstClaimRechecksLiveStateAndOwnership(t *testing.T) {
+	for _, change := range []string{"pool", "name", "controller", "plan", "image", "running", "stopping", "terminated", "missing"} {
+		t.Run(change, func(t *testing.T) {
+			cli, m := newCapacityCli(t)
+			m.ExpectedCalls[0].Maybe()
+			cli.cacheDir = t.TempDir()
+			s := capacitySpec(false)
+			s.StoppedPool = "bfd-linux"
+			candidate := poolCandidate(s.ControllerID, s.StoppedPool, s.StoppedPlan(), s.BootstrapParams.Image)
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return len(in.InstanceIds) == 0 }), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			live := candidate
+			live.Tags = append([]types.Tag{}, candidate.Tags...)
+			switch change {
+			case "pool":
+				live.Tags = append(live.Tags, types.Tag{Key: aws.String("GARM_POOL_ID"), Value: aws.String("another-pool")})
+			case "name":
+				live.Tags = append(live.Tags, types.Tag{Key: aws.String("Name"), Value: aws.String("another-runner")})
+			case "controller":
+				live.Tags[0].Value = aws.String("other-controller")
+			case "plan":
+				live.Tags[2].Value = aws.String("other-plan")
+			case "image":
+				live.ImageId = aws.String("ami-other")
+			case "running":
+				live.State = &types.InstanceState{Name: types.InstanceStateNameRunning}
+			case "stopping":
+				live.State = &types.InstanceState{Name: types.InstanceStateNameStopping}
+			case "terminated":
+				live.State = &types.InstanceState{Name: types.InstanceStateNameTerminated}
+			}
+			response := instanceResponse(live)
+			if change == "missing" {
+				response = &ec2.DescribeInstancesOutput{}
+			}
+			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
+				return len(in.InstanceIds) == 1 && in.InstanceIds[0] == "i-claim"
+			}), mock.Anything).Run(func(mock.Arguments) {
+				_, err := os.Stat(filepath.Join(cli.cacheDir, "claims", "i-claim"))
+				require.NoError(t, err, "live lookup must follow reservation")
+			}).Return(response, nil).Once()
+			_, err := cli.CreateRunningInstance(context.Background(), s)
+			require.Error(t, err)
+			for _, method := range []string{"ModifyInstanceAttribute", "CreateTags", "StartInstances", "TerminateInstances", "RunInstances"} {
+				m.AssertNotCalled(t, method, mock.Anything, mock.Anything, mock.Anything)
+			}
 			m.AssertExpectations(t)
 		})
 	}

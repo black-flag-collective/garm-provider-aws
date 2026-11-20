@@ -38,8 +38,23 @@ fi
 	// GARM's generated service otherwise waits for sysinit via its default
 	// dependencies and network.target, undoing the early bootstrap benefit.
 	old := "sudo mv $SVC_NAME /etc/systemd/system/"
-	replacement := `if [[ -x /usr/local/sbin/bfd-bootstrap-once ]]; then
- sed -i 's/^After=network.target$/DefaultDependencies=no\nAfter=local-fs.target systemd-networkd.service/' "$SVC_NAME"
+	replacement := `# bfd-early-unit-begin
+bfdConfigureEarlyUnit() {
+ local unit_file="$1" line
+ {
+  while IFS= read -r line || [[ -n "$line" ]]; do
+   if [[ "$line" == 'After=network.target' ]]; then
+    printf '%s\n' 'DefaultDependencies=no' 'After=local-fs.target systemd-networkd.service'
+   else
+    printf '%s\n' "$line"
+   fi
+  done < "$unit_file"
+ } > "$unit_file.bfd-early" || return 1
+ mv -- "$unit_file.bfd-early" "$unit_file"
+}
+# bfd-early-unit-end
+if [[ -x /usr/local/sbin/bfd-bootstrap-once ]]; then
+ bfdConfigureEarlyUnit "$SVC_NAME" || fail "failed to configure early runner service"
 fi
 ` + old
 	if !strings.Contains(string(script), old) {

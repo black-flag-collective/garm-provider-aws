@@ -54,6 +54,7 @@ func TestUncertainColdFallbackRecoversOrReplaysSamePlacement(t *testing.T) {
 			m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
 				return len(in.Filters) > 0 && aws.ToString(in.Filters[0].Name) == "tag:GARM_CONTROLLER_ID"
 			}), mock.Anything).Return(instanceResponse(candidate), nil).Once()
+			expectInitialClaimLookup(m, candidate)
 			m.On("ModifyInstanceAttribute", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.ModifyInstanceAttributeOutput{}, nil).Once()
 			m.On("CreateTags", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.CreateTagsOutput{}, nil).Once()
 			m.On("StartInstances", mock.Anything, mock.Anything, mock.Anything).Return((*ec2.StartInstancesOutput)(nil), noCapacity).Once()
