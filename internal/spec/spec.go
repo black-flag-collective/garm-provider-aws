@@ -88,6 +88,12 @@ type extraSpecs struct {
 	DisableUpdates     *bool            `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
 	EnableBootDebug    *bool            `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable boot debug on the VM."`
 	ExtraPackages      []string         `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
+	// Capacity options (Black Flag fork). Launches try spot first when spot is
+	// set, across every flavor and subnet, then on-demand unless disabled.
+	Spot             *bool    `json:"spot,omitempty" jsonschema:"description=Launch runners as one-time spot instances first."`
+	OnDemandFallback *bool    `json:"on_demand_fallback,omitempty" jsonschema:"description=When spot is set, fall back to on-demand if no spot capacity is found. Default true."`
+	FallbackSubnets  []string `json:"fallback_subnet_ids,omitempty" jsonschema:"pattern=^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$,description=More subnets to try, in order, after subnet_id has no capacity."`
+	FallbackFlavors  []string `json:"fallback_flavors,omitempty" jsonschema:"description=More instance types to try, in order, after the pool flavor has no capacity."`
 	cloudconfig.CloudConfigSpec
 }
 
@@ -136,6 +142,10 @@ type RunnerSpec struct {
 	VolumeSize         *int32
 	VolumeType         types.VolumeType
 	ControllerID       string
+	Spot               bool
+	SpotOnly           bool
+	FallbackSubnets    []string
+	FallbackFlavors    []string
 }
 
 func (r *RunnerSpec) Validate() error {
@@ -205,6 +215,19 @@ func (r *RunnerSpec) Validate() error {
 }
 
 func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+	if extraSpecs.Spot != nil {
+		r.Spot = *extraSpecs.Spot
+	}
+	if extraSpecs.OnDemandFallback != nil {
+		r.SpotOnly = !*extraSpecs.OnDemandFallback
+	}
+	if len(extraSpecs.FallbackSubnets) > 0 {
+		r.FallbackSubnets = extraSpecs.FallbackSubnets
+	}
+	if len(extraSpecs.FallbackFlavors) > 0 {
+		r.FallbackFlavors = extraSpecs.FallbackFlavors
+	}
+
 	if extraSpecs.SubnetID != nil && *extraSpecs.SubnetID != "" {
 		r.SubnetID = *extraSpecs.SubnetID
 	}
@@ -246,6 +269,53 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
 			Arn: extraSpecs.IAMInstanceProfile,
 		}
 	}
+}
+
+// LaunchAttempt is one market, instance type and subnet to try.
+type LaunchAttempt struct {
+	Spot     bool
+	Flavor   string
+	SubnetID string
+}
+
+// LaunchAttempts lists every placement to try, in order: spot across each
+// flavor and subnet first when spot is on, then on-demand across the same set.
+// Subnets vary fastest, so a short zone is skipped before a family changes.
+func (r *RunnerSpec) LaunchAttempts() []LaunchAttempt {
+	flavors := uniqueNonEmpty(append([]string{r.BootstrapParams.Flavor}, r.FallbackFlavors...))
+	subnets := uniqueNonEmpty(append([]string{r.SubnetID}, r.FallbackSubnets...))
+	if len(subnets) == 0 {
+		subnets = []string{""}
+	}
+	markets := []bool{false}
+	if r.Spot {
+		markets = []bool{true}
+		if !r.SpotOnly {
+			markets = append(markets, false)
+		}
+	}
+	var attempts []LaunchAttempt
+	for _, spot := range markets {
+		for _, flavor := range flavors {
+			for _, subnet := range subnets {
+				attempts = append(attempts, LaunchAttempt{Spot: spot, Flavor: flavor, SubnetID: subnet})
+			}
+		}
+	}
+	return attempts
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range values {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func (r *RunnerSpec) ComposeUserData() (string, error) {

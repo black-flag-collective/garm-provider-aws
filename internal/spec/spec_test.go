@@ -654,3 +654,34 @@ func TestMergeExtraSpecs(t *testing.T) {
 		})
 	}
 }
+
+func TestCapacityExtraSpecs(t *testing.T) {
+	raw := []byte(`{"spot": true, "on_demand_fallback": false, "fallback_subnet_ids": ["subnet-bbbbbbbb"], "fallback_flavors": ["m7a.large"]}`)
+	require.NoError(t, jsonSchemaValidation(raw))
+	es := &extraSpecs{}
+	require.NoError(t, json.Unmarshal(raw, es))
+	r := &RunnerSpec{}
+	r.MergeExtraSpecs(es)
+	require.True(t, r.Spot)
+	require.True(t, r.SpotOnly)
+	require.Equal(t, []string{"subnet-bbbbbbbb"}, r.FallbackSubnets)
+	require.Equal(t, []string{"m7a.large"}, r.FallbackFlavors)
+
+	plain := &RunnerSpec{}
+	plain.MergeExtraSpecs(&extraSpecs{})
+	require.False(t, plain.Spot)
+	require.False(t, plain.SpotOnly)
+}
+
+func TestFallbackSubnetValidation(t *testing.T) {
+	property, ok := generateJSONSchema().Definitions["extraSpecs"].Properties.Get("fallback_subnet_ids")
+	require.True(t, ok)
+	require.NotNil(t, property.Items)
+	require.Equal(t, "^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$", property.Items.Pattern)
+	for _, value := range []string{`{"fallback_subnet_ids":["subnet-12345678","subnet-0123456789abcdef0"]}`, `{"fallback_subnet_ids":[]}`} {
+		require.NoError(t, jsonSchemaValidation([]byte(value)))
+	}
+	for _, value := range []string{`{"fallback_subnet_ids":["bad"]}`, `{"fallback_subnet_ids":["subnet-12345678","subnet-no"]}`, `{"fallback_subnet_ids":[""]}`} {
+		require.Error(t, jsonSchemaValidation([]byte(value)))
+	}
+}

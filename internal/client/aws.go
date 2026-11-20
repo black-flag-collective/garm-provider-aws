@@ -17,12 +17,18 @@ package client
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"github.com/cloudbase/garm-provider-aws/config"
 	"github.com/cloudbase/garm-provider-aws/internal/spec"
 	"github.com/cloudbase/garm-provider-aws/internal/util"
@@ -42,6 +48,11 @@ func NewAwsCli(ctx context.Context, cfg *config.Config) (*AwsCli, error) {
 		client: client,
 	}
 
+	if cfg.CacheDir != "" {
+		awsCli.cacheDir = cfg.CacheDir
+	} else if dir, err := os.UserCacheDir(); err == nil {
+		awsCli.cacheDir = filepath.Join(dir, "garm-provider-aws")
+	}
 	return awsCli, nil
 }
 
@@ -57,7 +68,8 @@ type ClientInterface interface {
 type AwsCli struct {
 	cfg *config.Config
 
-	client ClientInterface
+	client   ClientInterface
+	cacheDir string
 }
 
 func (a *AwsCli) Config() *config.Config {
@@ -244,78 +256,145 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		return "", fmt.Errorf("failed to compose user data: %w", err)
 	}
 
-	images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Filters: []types.Filter{
-			{
-				Name:   aws.String("image-id"),
-				Values: []string{spec.BootstrapParams.Image},
-			},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to query AMI root volume: %w", err)
-	}
-	if len(images.Images) != 1 {
-		return "", fmt.Errorf("failed to query AMI root volume: AMI %s not found", spec.BootstrapParams.Image)
-	}
-	if images.Images[0].RootDeviceName == nil {
-		return "", fmt.Errorf("failed to query AMI root volume: root device is nil")
-	}
-	root_volume := *images.Images[0].RootDeviceName
-
-	resp, err := a.client.RunInstances(ctx, &ec2.RunInstancesInput{
-		ImageId:            aws.String(spec.BootstrapParams.Image),
-		InstanceType:       types.InstanceType(spec.BootstrapParams.Flavor),
-		MaxCount:           aws.Int32(1),
-		MinCount:           aws.Int32(1),
-		SubnetId:           aws.String(spec.SubnetID),
-		SecurityGroupIds:   spec.SecurityGroupIds,
-		UserData:           aws.String(udata),
-		KeyName:            spec.SSHKeyName,
-		IamInstanceProfile: spec.IAMInstanceProfile,
-		BlockDeviceMappings: []types.BlockDeviceMapping{
-			{
-				DeviceName: aws.String(root_volume),
-				Ebs: &types.EbsBlockDevice{
-					DeleteOnTermination: aws.Bool(true),
-					Iops:                spec.Iops,
-					Throughput:          spec.Throughput,
-					VolumeSize:          spec.VolumeSize,
-					VolumeType:          spec.VolumeType,
+	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
+	root_volume := a.cached(imageKey)
+	if root_volume == "" {
+		images, err := a.client.DescribeImages(ctx, &ec2.DescribeImagesInput{
+			Filters: []types.Filter{
+				{
+					Name:   aws.String("image-id"),
+					Values: []string{spec.BootstrapParams.Image},
 				},
 			},
-		},
-		TagSpecifications: []types.TagSpecification{
-			{
-				ResourceType: types.ResourceTypeInstance,
-				Tags: []types.Tag{
-					{
-						Key:   aws.String("Name"),
-						Value: aws.String(spec.BootstrapParams.Name),
-					},
-					{
-						Key:   aws.String("GARM_POOL_ID"),
-						Value: aws.String(spec.BootstrapParams.PoolID),
-					},
-					{
-						Key:   aws.String("OSType"),
-						Value: aws.String(string(spec.BootstrapParams.OSType)),
-					},
-					{
-						Key:   aws.String("OSArch"),
-						Value: aws.String(string(spec.BootstrapParams.OSArch)),
-					},
-					{
-						Key:   aws.String("GARM_CONTROLLER_ID"),
-						Value: aws.String(spec.ControllerID),
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to query AMI root volume: %w", err)
+		}
+		if len(images.Images) != 1 {
+			return "", fmt.Errorf("failed to query AMI root volume: AMI %s not found", spec.BootstrapParams.Image)
+		}
+		if images.Images[0].RootDeviceName == nil {
+			return "", fmt.Errorf("failed to query AMI root volume: root device is nil")
+		}
+		root_volume = *images.Images[0].RootDeviceName
+		a.remember(imageKey, root_volume, time.Hour)
+	}
+
+	var lastErr error
+	for _, attempt := range a.launchAttempts(spec) {
+		var subnetID *string
+		if attempt.SubnetID != "" {
+			subnetID = aws.String(attempt.SubnetID)
+		}
+		input := &ec2.RunInstancesInput{
+			ImageId:            aws.String(spec.BootstrapParams.Image),
+			InstanceType:       types.InstanceType(attempt.Flavor),
+			MaxCount:           aws.Int32(1),
+			MinCount:           aws.Int32(1),
+			SubnetId:           subnetID,
+			SecurityGroupIds:   spec.SecurityGroupIds,
+			UserData:           aws.String(udata),
+			KeyName:            spec.SSHKeyName,
+			IamInstanceProfile: spec.IAMInstanceProfile,
+			BlockDeviceMappings: []types.BlockDeviceMapping{
+				{
+					DeviceName: aws.String(root_volume),
+					Ebs: &types.EbsBlockDevice{
+						DeleteOnTermination: aws.Bool(true),
+						Iops:                spec.Iops,
+						Throughput:          spec.Throughput,
+						VolumeSize:          spec.VolumeSize,
+						VolumeType:          spec.VolumeType,
 					},
 				},
 			},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create instance: %w", err)
+			TagSpecifications: []types.TagSpecification{
+				{
+					ResourceType: types.ResourceTypeInstance,
+					Tags: []types.Tag{
+						{
+							Key:   aws.String("Name"),
+							Value: aws.String(spec.BootstrapParams.Name),
+						},
+						{
+							Key:   aws.String("GARM_POOL_ID"),
+							Value: aws.String(spec.BootstrapParams.PoolID),
+						},
+						{
+							Key:   aws.String("OSType"),
+							Value: aws.String(string(spec.BootstrapParams.OSType)),
+						},
+						{
+							Key:   aws.String("OSArch"),
+							Value: aws.String(string(spec.BootstrapParams.OSArch)),
+						},
+						{
+							Key:   aws.String("GARM_CONTROLLER_ID"),
+							Value: aws.String(spec.ControllerID),
+						},
+					},
+				},
+			},
+		}
+		if attempt.Spot {
+			input.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
+				MarketType: types.MarketTypeSpot,
+				SpotOptions: &types.SpotMarketOptions{
+					SpotInstanceType:             types.SpotInstanceTypeOneTime,
+					InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorTerminate,
+				},
+			}
+		}
+		resp, err := a.client.RunInstances(ctx, input, func(o *ec2.Options) {
+			if o.Retryer == nil {
+				o.Retryer = retry.NewStandard()
+			}
+			o.Retryer = placementRetryer{o.Retryer}
+		})
+		if err == nil {
+			if len(resp.Instances) == 0 || resp.Instances[0].InstanceId == nil {
+				return "", fmt.Errorf("failed to create instance: empty response")
+			}
+			return *resp.Instances[0].InstanceId, nil
+		}
+		lastErr = err
+		if !isCapacityError(err) {
+			return "", fmt.Errorf("failed to create instance: %w", err)
+		}
+		a.remember(placementKey(spec, attempt), "refused", 3*time.Minute)
+		market := "on-demand"
+		if attempt.Spot {
+			market = "spot"
+		}
+		fmt.Fprintf(os.Stderr, "garm-provider-aws: no %s capacity for %s in %s, trying the next placement: %v\n", market, attempt.Flavor, attempt.SubnetID, err)
 	}
+	return "", fmt.Errorf("failed to create instance: no capacity in any placement: %w", lastErr)
+}
 
-	return *resp.Instances[0].InstanceId, nil
+// capacityErrors are the EC2 error codes that mean "try another placement".
+var capacityErrors = []string{
+	"InsufficientInstanceCapacity",
+	"InsufficientCapacityOnHost",
+	"InsufficientHostCapacity",
+	"SpotMaxPriceTooLow",
+	"MaxSpotInstanceCountExceeded",
+	"InsufficientFreeAddressesInSubnet",
+	"UnfulfillableCapacity",
+}
+
+func isCapacityError(err error) bool {
+	var apiErr smithy.APIError
+	if !stderrors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.ErrorCode() == "Unsupported" {
+		message := strings.ToLower(apiErr.ErrorMessage())
+		return strings.Contains(message, "requested instance type") && strings.Contains(message, "not supported") && strings.Contains(message, "availability zone")
+	}
+	for _, code := range capacityErrors {
+		if apiErr.ErrorCode() == code {
+			return true
+		}
+	}
+	return false
 }
