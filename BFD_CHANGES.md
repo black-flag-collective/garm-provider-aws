@@ -33,3 +33,26 @@ GARM service user (for example `/var/lib/garm/provider-cache`). Otherwise the
 OS user cache directory is used. Missing, expired or corrupt entries and write
 failures degrade to a normal lookup or the original placement order. Cached
 entries contain no credentials or bootstrap data.
+
+## v0.1.6-bfd.3
+
+`early_bootstrap: true` adds a shared idempotence guard for the baked
+`bfd-bootstrap-once` helper and starts the JIT runner without waiting on
+sysinit/network.target. It requires a preconfigured Linux JIT image with
+updates, extra packages, custom CA and preinstall scripts disabled. Without
+the helper, cloud-init retains the normal bootstrap path.
+
+`stopped_pool: "bfd-linux"` first claims a matching stopped reserve, updates
+its user data while stopped, adds GARM's job tags, and starts it. Empty
+reserves fall through to the usual cold launch. The reserve keeper in runner-os
+owns unclaimed instances; GARM owns claimed instances and terminates them after
+one job. Durable exclusive claim files and process locks in `cache_dir/claims`
+prevent reuse across concurrent provider processes, stale EC2 listings and
+provider crashes. Only a definitive capacity refusal permits another launch
+after a start attempt; an ambiguous response is returned without duplication.
+
+The keeper and provider match a SHA-256 fingerprint of the image, allowed
+placements, security groups, instance profile and disk configuration. Reserve
+instances carry `GARM_CONTROLLER_ID`, `BFD_STOPPED_POOL`, and
+`BFD_STOPPED_PLAN`, but never `GARM_POOL_ID` until claimed. Both processes run
+on the single GARM host and share the persistent cache volume.

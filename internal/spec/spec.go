@@ -77,6 +77,7 @@ func newExtraSpecsFromBootstrapData(data params.BootstrapInstance) (*extraSpecs,
 }
 
 type extraSpecs struct {
+	StoppedPool        string           `json:"stopped_pool,omitempty" jsonschema:"description=Prebooted one-use stopped pool name."`
 	EarlyBootstrap     bool             `json:"early_bootstrap,omitempty" jsonschema:"description=Use the preinstalled Black Flag early bootstrap helper."`
 	SubnetID           *string          `json:"subnet_id,omitempty" jsonschema:"pattern=^subnet-(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{17})$,description=The ID of the subnet formatted as subnet-xxxxxxxxxxxxxxxxx."`
 	SSHKeyName         *string          `json:"ssh_key_name,omitempty" jsonschema:"description=The name of the Key Pair to use for the instance."`
@@ -128,6 +129,8 @@ func GetRunnerSpecFromBootstrapParams(cfg *config.Config, data params.BootstrapI
 }
 
 type RunnerSpec struct {
+	EarlyBootstrap     bool
+	StoppedPool        string
 	Region             string
 	DisableUpdates     bool
 	ExtraPackages      []string
@@ -150,6 +153,9 @@ type RunnerSpec struct {
 }
 
 func (r *RunnerSpec) Validate() error {
+	if r.StoppedPool != "" && (!r.EarlyBootstrap || r.Spot || r.BootstrapParams.OSType != params.Linux) {
+		return fmt.Errorf("stopped pools require early_bootstrap on on-demand Linux runners")
+	}
 	if r.Region == "" {
 		return fmt.Errorf("missing region")
 	}
@@ -216,6 +222,8 @@ func (r *RunnerSpec) Validate() error {
 }
 
 func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+	r.StoppedPool = extraSpecs.StoppedPool
+	r.EarlyBootstrap = extraSpecs.EarlyBootstrap
 	if extraSpecs.Spot != nil {
 		r.Spot = *extraSpecs.Spot
 	}

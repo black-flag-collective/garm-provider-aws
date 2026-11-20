@@ -55,3 +55,12 @@ func (m *MockComputeClient) DescribeImages(ctx context.Context, params *ec2.Desc
 	args := m.Called(ctx, params, optFns)
 	return args.Get(0).(*ec2.DescribeImagesOutput), args.Error(1)
 }
+
+func (m *MockComputeClient) ModifyInstanceAttribute(ctx context.Context, params *ec2.ModifyInstanceAttributeInput, optFns ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
+	args := m.Called(ctx, params, optFns)
+	return args.Get(0).(*ec2.ModifyInstanceAttributeOutput), args.Error(1)
+}
+func (m *MockComputeClient) CreateTags(ctx context.Context, params *ec2.CreateTagsInput, optFns ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
+	args := m.Called(ctx, params, optFns)
+	return args.Get(0).(*ec2.CreateTagsOutput), args.Error(1)
+}

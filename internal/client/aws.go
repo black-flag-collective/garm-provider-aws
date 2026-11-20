@@ -256,6 +256,10 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
 		return "", fmt.Errorf("failed to compose user data: %w", err)
 	}
 
+	if id, err := a.claimStopped(ctx, spec, udata); err != nil || id != "" {
+		return id, err
+	}
+
 	imageKey := "image/" + spec.ControllerID + "/" + spec.BootstrapParams.Image
 	root_volume := a.cached(imageKey)
 	if root_volume == "" {
