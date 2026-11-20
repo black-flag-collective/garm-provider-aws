@@ -13,6 +13,7 @@ require (
 	github.com/invopop/jsonschema v0.14.0
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -44,5 +45,4 @@ require (
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
