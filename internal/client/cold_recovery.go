@@ -52,24 +52,30 @@ func (a *AwsCli) recoverCold(ctx context.Context, s *spec.RunnerSpec, record *os
 	if err != nil {
 		return "", fmt.Errorf("recover cold runner: %w", err)
 	}
+	var matches []types.Instance
 	for _, reservation := range response.Reservations {
-		for _, instance := range reservation.Instances {
-			if aws.ToString(instance.ClientToken) != claim.Cold.Token || tagValue(instance.Tags, "Name") != s.BootstrapParams.Name || tagValue(instance.Tags, "GARM_POOL_ID") != s.BootstrapParams.PoolID || tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
-				return "", fmt.Errorf("cold runner ownership not yet visible")
-			}
-			if instance.State == nil || (instance.State.Name != types.InstanceStateNamePending && instance.State.Name != types.InstanceStateNameRunning) {
-				return "", fmt.Errorf("cold runner is no longer starting or running")
-			}
-			id := aws.ToString(instance.InstanceId)
-			if id == "" {
-				return "", fmt.Errorf("cold runner ID not yet visible")
-			}
-			claim.Cold.ID = id
-			if err := saveRunnerClaim(record, *claim); err != nil {
-				return "", err
-			}
-			return id, nil
+		matches = append(matches, reservation.Instances...)
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("multiple instances match the cold launch token; refusing ambiguous recovery")
+	}
+	if len(matches) == 1 {
+		instance := matches[0]
+		if aws.ToString(instance.ClientToken) != claim.Cold.Token || tagValue(instance.Tags, "Name") != s.BootstrapParams.Name || tagValue(instance.Tags, "GARM_POOL_ID") != s.BootstrapParams.PoolID || tagValue(instance.Tags, "GARM_CONTROLLER_ID") != s.ControllerID {
+			return "", fmt.Errorf("cold runner ownership not yet visible")
 		}
+		if instance.State == nil || (instance.State.Name != types.InstanceStateNamePending && instance.State.Name != types.InstanceStateNameRunning) {
+			return "", fmt.Errorf("cold runner is no longer starting or running")
+		}
+		id := aws.ToString(instance.InstanceId)
+		if id == "" {
+			return "", fmt.Errorf("cold runner ID not yet visible")
+		}
+		claim.Cold.ID = id
+		if err := saveRunnerClaim(record, *claim); err != nil {
+			return "", err
+		}
+		return id, nil
 	}
 	// EC2 idempotency tokens have a bounded lifetime. Never replay an old unknown
 	// result after the retention window; a later Describe can still recover it.

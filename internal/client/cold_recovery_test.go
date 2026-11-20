@@ -137,3 +137,26 @@ func TestUnknownColdOutcomeNeverChangesRequestOrReplaysExpiredToken(t *testing.T
 		})
 	}
 }
+
+func TestColdRecoveryRejectsMultipleTokenMatches(t *testing.T) {
+	cli, m := newCapacityCli(t)
+	m.ExpectedCalls[0].Maybe()
+	cli.cacheDir = t.TempDir()
+	s := capacitySpec(false)
+	s.StoppedPool = "bfd-linux"
+	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool {
+		return aws.ToString(in.Filters[0].Name) == "tag:GARM_CONTROLLER_ID"
+	}), mock.Anything).Return(&ec2.DescribeInstancesOutput{}, nil).Once()
+	var original *ec2.RunInstancesInput
+	m.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) { original = args.Get(1).(*ec2.RunInstancesInput) }).Return((*ec2.RunInstancesOutput)(nil), fmt.Errorf("response lost")).Once()
+	_, err := cli.CreateRunningInstance(context.Background(), s)
+	require.Error(t, err)
+	candidate := types.Instance{InstanceId: aws.String("i-first"), ClientToken: original.ClientToken, State: &types.InstanceState{Name: types.InstanceStateNamePending}, Tags: original.TagSpecifications[0].Tags}
+	second := candidate
+	second.InstanceId = aws.String("i-second")
+	m.On("DescribeInstances", mock.Anything, mock.MatchedBy(func(in *ec2.DescribeInstancesInput) bool { return aws.ToString(in.Filters[0].Name) == "client-token" }), mock.Anything).Return(&ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{candidate}}, {Instances: []types.Instance{second}}}}, nil).Once()
+	other := &AwsCli{cfg: cli.cfg, client: m, cacheDir: cli.cacheDir}
+	_, err = other.CreateRunningInstance(context.Background(), s)
+	require.ErrorContains(t, err, "multiple instances")
+	m.AssertExpectations(t)
+}
