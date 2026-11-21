@@ -2,6 +2,7 @@ package spec
 
 import (
 	"bytes"
+	"compress/gzip"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -105,12 +106,22 @@ fi
 		if err != nil {
 			return "", err
 		}
+		// Keep the outer cloud-config uncompressed: the baked early reader
+		// consumes plain YAML from IMDS. Compress only the pinned templates.
+		var packed bytes.Buffer
+		compressor := gzip.NewWriter(&packed)
+		if _, err := compressor.Write(encoded); err != nil {
+			return "", err
+		}
+		if err := compressor.Close(); err != nil {
+			return "", err
+		}
 		validator := `bfdValidateEarlyInstall() {
- python3 - "$1" '` + base64.StdEncoding.EncodeToString(encoded) + `' <<'BFD_VALIDATE_TEMPLATE'
-import base64, json, pathlib, re, sys
+ python3 - "$1" '` + base64.StdEncoding.EncodeToString(packed.Bytes()) + `' <<'BFD_VALIDATE_TEMPLATE'
+import base64, gzip, json, pathlib, re, sys
 try:
     script = pathlib.Path(sys.argv[1]).read_text()
-    templates = json.loads(base64.b64decode(sys.argv[2]))
+    templates = json.loads(gzip.decompress(base64.b64decode(sys.argv[2])))
     scalar = r"[A-Za-z0-9_.-]*"
     url = r"[A-Za-z0-9_./:@?&=%+,~-]*"
     for template in templates:
