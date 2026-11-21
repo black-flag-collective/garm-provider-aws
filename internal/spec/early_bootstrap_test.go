@@ -106,9 +106,10 @@ func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
 	tools := params.RunnerApplicationDownload{OS: aws.String("linux"), Architecture: aws.String("amd64"), DownloadURL: aws.String("https://example.test/runner"), Filename: aws.String("runner.tgz")}
 	data, err := linuxCloudConfig(p, tools)
 	require.NoError(t, err)
+	require.Less(t, len(data), 16*1024, "the baked early reader needs uncompressed cloud-config")
 	compressed, err := maybeCompressUserdata([]byte(data), params.Linux)
 	require.NoError(t, err)
-	require.Less(t, len(compressed), 16*1024)
+	require.Equal(t, data, string(compressed))
 	var config struct {
 		Files []struct {
 			Content string `yaml:"content"`
