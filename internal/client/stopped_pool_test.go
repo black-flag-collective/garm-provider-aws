@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestStoppedClaimConcurrentOneUse(t *testing.T) {
@@ -483,5 +484,29 @@ func TestFirstClaimRechecksLiveStateAndOwnership(t *testing.T) {
 			}
 			m.AssertExpectations(t)
 		})
+	}
+}
+
+func TestForeignStoppedReservationDoesNotWaitForOwner(t *testing.T) {
+	dir := t.TempDir()
+	owner, err := reserveStopped(dir, "i-busy", "runner-owner")
+	require.NoError(t, err)
+	defer owner.Close()
+	result := make(chan error, 1)
+	go func() {
+		f, err := reserveStopped(dir, "i-busy", "runner-other")
+		if f != nil {
+			f.Close()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, os.ErrExist)
+	case <-time.After(time.Second):
+		// Release the owner before failing so the test never leaves a goroutine.
+		owner.Close()
+		<-result
+		t.Fatal("a foreign reservation waited for the owner's EC2 work")
 	}
 }
