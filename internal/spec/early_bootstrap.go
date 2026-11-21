@@ -1,13 +1,46 @@
 package spec
 
 import (
+	"bytes"
+	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"text/template"
 
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	"github.com/cloudbase/garm-provider-common/params"
 )
+
+// The full upstream template is pinned so matching an install line in dead
+// shell code cannot authorize an otherwise unknown program. Dynamic scalar
+// fields may vary, but cannot contain shell syntax or newlines.
+//
+//go:embed testdata/garm-v0.2.1-github-linux.tmpl
+var supportedGarmTemplate string
+
+const templateScalar = "BFD_TEMPLATE_SCALAR_1a0ac5"
+
+func supportedGarmScripts() ([]string, error) {
+	t, err := template.New("garm").Parse(supportedGarmTemplate)
+	if err != nil {
+		return nil, err
+	}
+	var scripts []string
+	for _, debug := range []bool{false, true} {
+		ctx := map[string]any{"UseJITConfig": true, "AgentMode": false, "EnableBootDebug": debug}
+		for _, key := range []string{"DownloadURL", "CallbackURL", "MetadataURL", "CallbackToken", "RunnerUsername", "RunnerGroup", "AgentDownloadURL", "AgentURL", "AgentToken", "AgentShell", "TempDownloadToken", "FileName"} {
+			ctx[key] = templateScalar + key + "_"
+		}
+		var buf bytes.Buffer
+		if err := t.Execute(&buf, ctx); err != nil {
+			return nil, err
+		}
+		scripts = append(scripts, buf.String())
+	}
+	return scripts, nil
+}
 
 func linuxCloudConfig(p params.BootstrapInstance, tools params.RunnerApplicationDownload) (string, error) {
 	var extra extraSpecs
@@ -64,7 +97,35 @@ fi
 	} else if strings.Contains(string(script), "\n/tmp/real-install.sh\n") {
 		// GARM v0.2.1 supplies a wrapper, not its actual install template. Patch
 		// the downloaded script before execution, preserving GARM's callbacks.
-		prepare := unitFunction + `# bfd-early-prepare-begin
+		templates, err := supportedGarmScripts()
+		if err != nil {
+			return "", err
+		}
+		encoded, err := json.Marshal(templates)
+		if err != nil {
+			return "", err
+		}
+		validator := `bfdValidateEarlyInstall() {
+ python3 - "$1" '` + base64.StdEncoding.EncodeToString(encoded) + `' <<'BFD_VALIDATE_TEMPLATE'
+import base64, json, pathlib, re, sys
+try:
+    script = pathlib.Path(sys.argv[1]).read_text()
+    templates = json.loads(base64.b64decode(sys.argv[2]))
+    scalar = r"[A-Za-z0-9_.-]*"
+    url = r"[A-Za-z0-9_./:@?&=%+,~-]*"
+    for template in templates:
+        parts = re.split(r"(BFD_TEMPLATE_SCALAR_1a0ac5[A-Za-z]+_)", template)
+        pattern = "".join((url if part.endswith("URL_") else scalar) if i % 2 else re.escape(part) for i, part in enumerate(parts))
+        if re.fullmatch(pattern, script):
+            sys.exit(0)
+except (OSError, UnicodeError, ValueError):
+    pass
+print("early bootstrap: unsupported downloaded install template", file=sys.stderr)
+sys.exit(1)
+BFD_VALIDATE_TEMPLATE
+}
+`
+		prepare := unitFunction + validator + `# bfd-early-prepare-begin
 bfdWriteEarlyInstall() {
  local script="$1" line trimmed count=0
   printf '%s\n' '#!/bin/bash' || return 1
@@ -85,6 +146,7 @@ bfdWriteEarlyInstall() {
 }
 bfdPrepareEarlyInstall() {
  local script="$1" temporary
+ bfdValidateEarlyInstall "$script" || return 1
  temporary=$(mktemp "$script.bfd-early.XXXXXX") || return 1
  bfdWriteEarlyInstall "$script" > "$temporary" && chmod 0700 "$temporary" && mv -- "$temporary" "$script" || {
   rm -f -- "$temporary"

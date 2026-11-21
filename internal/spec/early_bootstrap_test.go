@@ -3,9 +3,11 @@ package spec
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -104,6 +106,9 @@ func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
 	tools := params.RunnerApplicationDownload{OS: aws.String("linux"), Architecture: aws.String("amd64"), DownloadURL: aws.String("https://example.test/runner"), Filename: aws.String("runner.tgz")}
 	data, err := linuxCloudConfig(p, tools)
 	require.NoError(t, err)
+	compressed, err := maybeCompressUserdata([]byte(data), params.Linux)
+	require.NoError(t, err)
+	require.Less(t, len(compressed), 16*1024)
 	var config struct {
 		Files []struct {
 			Content string `yaml:"content"`
@@ -123,47 +128,70 @@ func TestEarlyBootstrapGarmWrapperExecutesDownloadedScript(t *testing.T) {
 	out, err := exec.Command("bash", "-n", path).CombinedOutput()
 	require.NoError(t, err, string(out))
 	// Mock network and privileged install boundaries, but execute the complete
-	// generated wrapper, its downloaded script, and the real unit transformation.
+	// generated wrapper and verify rejection before any downloaded command runs.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "curl"), []byte("#!/bin/bash\ncp \"$BFD_FIXTURE\" \"${@: -1}\"\n"), 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "sudo"), []byte("#!/bin/bash\n[[ $1 == mv ]] || exit 98\ncp \"$2\" \"$BFD_RESULT\"\n"), 0700))
 	fixture := filepath.Join(dir, "install-fixture.sh")
 	result := filepath.Join(dir, "installed.service")
+	templates, err := supportedGarmScripts()
+	require.NoError(t, err)
+	for i, expected := range templates {
+		t.Run(fmt.Sprintf("complete upstream template debug %d", i), func(t *testing.T) {
+			// Validate and transform the real rendered template without executing its
+			// privileged provisioning. The unit helper is execution-tested separately.
+			content := regexp.MustCompile(templateScalar+`[A-Za-z]+_`).ReplaceAllString(expected, "runner")
+			require.NoError(t, os.WriteFile(fixture, []byte(content), 0700))
+			start := strings.Index(body, "# bfd-early-unit-begin")
+			end := strings.Index(body, "# bfd-early-prepare-end")
+			require.Greater(t, end, start)
+			prepare := body[start:end] + "\nbfdPrepareEarlyInstall \"$1\""
+			out, err := exec.Command("bash", "-c", prepare, "test", fixture).CombinedOutput()
+			require.NoError(t, err, string(out))
+			transformed, err := os.ReadFile(fixture)
+			require.NoError(t, err)
+			require.Contains(t, string(transformed), "bfdConfigureEarlyUnit \"$SVC_NAME\" || exit 1\n")
+			require.NoError(t, exec.Command("bash", "-n", fixture).Run())
+		})
+	}
 	const install = `sudo mv $SVC_NAME /etc/systemd/system/ || fail "failed to move service file"`
-	prefix := "#!/bin/bash\nset -e\nSVC_NAME=runner.service\nprintf '%s\\n' '[Unit]' 'After=network.target' '[Service]' 'ExecStart=/runner' > \"$SVC_NAME\"\n"
 	for _, tc := range []struct {
-		name      string
-		line      string
-		supported bool
+		name string
+		line string
 	}{
-		{"real GARM command", install, true},
-		{"indented GARM command", "\t " + install + " \t", true},
-		{"missing command", "true", false},
-		{"comment", "# " + install, false},
-		{"echoed string", "echo '" + install + "'", false},
-		{"compound line", install + "; echo unsupported", false},
+		{"standalone command is not a supported template", install},
+		{"indented command is not a supported template", "\t " + install + " \t"},
+		{"unreachable branch", "if false; then\n" + install + "\nfi\nsudo mv runner.service /etc/systemd/system/"},
+		{"uncalled function", "unused() {\n" + install + "\n}\nsudo mv runner.service /etc/systemd/system/"},
+		{"heredoc", "cat <<'EOF'\n" + install + "\nEOF"},
+		{"changed whole template", "if false; then\n" + regexp.MustCompile(templateScalar+`[A-Za-z]+_`).ReplaceAllString(templates[0], "runner") + "\nfi"},
+		{"injected scalar", regexp.MustCompile(templateScalar+`[A-Za-z]+_`).ReplaceAllLiteralString(templates[0], "$(touch invalid)")},
+		{"missing command", "true"},
+		{"comment", "# " + install},
+		{"echoed string", "echo '" + install + "'"},
+		{"compound line", install + "; echo unsupported"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			content := prefix + tc.line + "\n"
-			if !tc.supported {
-				// Even commands preceding a lookalike must never execute.
-				content = "#!/bin/bash\necho should-not-run > \"$BFD_RESULT\"\n" + tc.line + "\n"
-			}
+			require.NoError(t, os.WriteFile(fixture, []byte(tc.line), 0700))
+			start := strings.Index(body, "# bfd-early-unit-begin")
+			end := strings.Index(body, "# bfd-early-prepare-end")
+			prepare := body[start:end] + "\nbfdPrepareEarlyInstall \"$1\""
+			output, prepareErr := exec.Command("bash", "-c", prepare, "test", fixture).CombinedOutput()
+			require.Error(t, prepareErr, string(output))
+			unchanged, readErr := os.ReadFile(fixture)
+			require.NoError(t, readErr)
+			require.Equal(t, tc.line, string(unchanged))
+			// A preceding side effect must not run even when an exact install
+			// command exists in a comment, dead branch or unused function.
+			content := "#!/bin/bash\necho should-not-run > \"$BFD_RESULT\"\n" + tc.line + "\n"
 			require.NoError(t, os.WriteFile(fixture, []byte(content), 0700))
 			_ = os.Remove(result)
 			cmd := exec.Command("bash", path)
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "BFD_BOOTSTRAP_LOCKED=1", "BFD_FIXTURE="+fixture, "BFD_RESULT="+result)
 			out, err := cmd.CombinedOutput()
-			if !tc.supported {
-				require.Error(t, err)
-				require.NoFileExists(t, result)
-				return
-			}
-			require.NoError(t, err, string(out))
-			unit, err := os.ReadFile(result)
-			require.NoError(t, err)
-			require.Contains(t, string(unit), "DefaultDependencies=no\nAfter=local-fs.target systemd-networkd.service\n")
-			require.NoFileExists(t, downloaded)
+			require.Error(t, err, string(out))
+			require.Contains(t, string(out), "unsupported downloaded install template")
+			require.NoFileExists(t, result)
 		})
 	}
 }
