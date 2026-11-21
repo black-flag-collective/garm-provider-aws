@@ -197,11 +197,26 @@ func syncDirectory(path string) error {
 func reserveStopped(dir, id, name string) (*os.File, error) {
 	path := filepath.Join(dir, id)
 	if f, err := os.OpenFile(path, os.O_RDWR, 0600); err == nil {
+		// Ownership is complete when linked into place and never rewritten.
+		// A foreign contender can skip it without waiting for the owner's EC2
+		// calls. Same-owner recovery still locks and rechecks below.
+		data, err := io.ReadAll(f)
+		if err != nil || strings.TrimSpace(string(data)) != name {
+			f.Close()
+			if err != nil {
+				return nil, err
+			}
+			return nil, os.ErrExist
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			f.Close()
+			return nil, err
+		}
 		if err := lockClaim(f); err != nil {
 			f.Close()
 			return nil, err
 		}
-		data, err := io.ReadAll(f)
+		data, err = io.ReadAll(f)
 		if err != nil || strings.TrimSpace(string(data)) != name {
 			f.Close()
 			if err != nil {
