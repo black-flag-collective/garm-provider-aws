@@ -72,3 +72,16 @@ placements, security groups, instance profile and disk configuration. Reserve
 instances carry `GARM_CONTROLLER_ID`, `BFD_STOPPED_POOL`, and
 `BFD_STOPPED_PLAN`, but never `GARM_POOL_ID` until claimed. Both processes run
 on the single GARM host and share the persistent cache volume.
+
+## v0.1.6-bfd.4
+
+Early bootstrap also accepts GARM v0.2.1's download wrapper. After the wrapper
+fetches the real install script, it adds the early systemd ordering adjustment
+before service installation, then executes GARM's script with its normal
+callbacks. Before executing any downloaded command, Python 3 (already in the
+prebuilt image) matches the entire pinned upstream GitHub JIT template. Only
+shell-safe scalar substitutions may vary; custom templates and agent mode fail
+closed. A template upgrade requires updating the pinned source and its tests.
+Regression tests validate/transform the complete upstream template, execute the
+unit adjustment, and run the generated download wrapper against unsupported
+scripts, including dead branches and uncalled functions.
