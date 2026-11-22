@@ -386,6 +386,7 @@ func TestCreateRunningInstance(t *testing.T) {
 		},
 	}, nil)
 	mockClient.On("RunInstances", ctx, mock.MatchedBy(func(input *ec2.RunInstancesInput) bool {
+		assertLaunchCostTags(t, input, "instance-name", "poolID", "controllerID", "linux", "")
 		return len(input.BlockDeviceMappings) == 1 && *input.BlockDeviceMappings[0].DeviceName == "/dev/abcd"
 	}), mock.Anything).Return(&ec2.RunInstancesOutput{
 		Instances: []types.Instance{
@@ -399,4 +400,26 @@ func TestCreateRunningInstance(t *testing.T) {
 	instance, err := awsCli.CreateRunningInstance(ctx, spec)
 	require.NoError(t, err)
 	require.Equal(t, instanceID, instance)
+}
+
+// Check the complete ownership tags as well as attribution, including duplicates.
+func assertLaunchCostTags(t *testing.T, input *ec2.RunInstancesInput, name, pool, controller, osType, arch string) {
+	t.Helper()
+	require.Len(t, input.TagSpecifications, 2)
+	expected := map[types.ResourceType]map[string]string{
+		types.ResourceTypeInstance: {"Name": name, "GARM_POOL_ID": pool, "GARM_CONTROLLER_ID": controller, "OSType": osType, "OSArch": arch, "bfd-cost": "runners"},
+		types.ResourceTypeVolume:   {"GARM_CONTROLLER_ID": controller, "bfd-cost": "runners"},
+	}
+	for _, specification := range input.TagSpecifications {
+		want, ok := expected[specification.ResourceType]
+		require.True(t, ok)
+		got := map[string]string{}
+		for _, tag := range specification.Tags {
+			got[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+		}
+		require.Len(t, specification.Tags, len(want))
+		require.Equal(t, want, got)
+		delete(expected, specification.ResourceType)
+	}
+	require.Empty(t, expected)
 }

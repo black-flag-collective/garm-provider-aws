@@ -39,6 +39,13 @@ func capacitySpec(spot bool) *spec.RunnerSpec {
 func newCapacityCli(t *testing.T) (*AwsCli, *MockComputeClient) {
 	t.Helper()
 	m := new(MockComputeClient)
+	t.Cleanup(func() {
+		for _, call := range m.Calls {
+			if call.Method == "RunInstances" {
+				assertLaunchCostTags(t, call.Arguments.Get(1).(*ec2.RunInstancesInput), "runner", "pool", "controller", "linux", "")
+			}
+		}
+	})
 	m.On("DescribeImages", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeImagesOutput{
 		Images: []types.Image{{ImageId: aws.String("ami-12345678"), RootDeviceName: aws.String("/dev/sda1")}},
 	}, nil)

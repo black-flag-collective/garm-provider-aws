@@ -85,3 +85,16 @@ closed. A template upgrade requires updating the pinned source and its tests.
 Regression tests validate/transform the complete upstream template, execute the
 unit adjustment, and run the generated download wrapper against unsupported
 scripts, including dead branches and uncalled functions.
+
+## Cold-launch cost attribution
+
+Cold launches tag instances and launch-created EBS volumes `bfd-cost=runners`.
+Volumes also carry `GARM_CONTROLLER_ID` for attribution joins; existing instance
+ownership and pool tags are unchanged. This is the BFD fork's runner cost category,
+not a generic configurable tagging interface. It does not backfill historical costs.
+
+The existing runner-stack TagOnLaunch policy covers volume tags during
+RunInstances; no additional IAM permission is needed. Before upgrading, allow
+in-flight cold creates to finish: persisted request digests include tags, so an
+old pending claim fails closed if retried with the new tag set. Token derivation,
+request digest validation and ownership checks remain unchanged.

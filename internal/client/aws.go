@@ -347,6 +347,7 @@ func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, 
 				{
 					ResourceType: types.ResourceTypeInstance,
 					Tags: []types.Tag{
+						{Key: aws.String("bfd-cost"), Value: aws.String("runners")},
 						{
 							Key:   aws.String("Name"),
 							Value: aws.String(spec.BootstrapParams.Name),
@@ -367,6 +368,13 @@ func (a *AwsCli) createColdInstance(ctx context.Context, spec *spec.RunnerSpec, 
 							Key:   aws.String("GARM_CONTROLLER_ID"),
 							Value: aws.String(spec.ControllerID),
 						},
+					},
+				},
+				{
+					ResourceType: types.ResourceTypeVolume,
+					Tags: []types.Tag{
+						{Key: aws.String("bfd-cost"), Value: aws.String("runners")},
+						{Key: aws.String("GARM_CONTROLLER_ID"), Value: aws.String(spec.ControllerID)},
 					},
 				},
 			},
