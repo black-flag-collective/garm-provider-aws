@@ -36,9 +36,19 @@ func capacitySpec(spot bool) *spec.RunnerSpec {
 	}
 }
 
-func newCapacityCli(t *testing.T) (*AwsCli, *MockComputeClient) {
+func newCapacityCli(t *testing.T, additionalRunnerNames ...string) (*AwsCli, *MockComputeClient) {
 	t.Helper()
 	m := new(MockComputeClient)
+	t.Cleanup(func() {
+		for _, call := range m.Calls {
+			if call.Method == "RunInstances" {
+				input := call.Arguments.Get(1).(*ec2.RunInstancesInput)
+				name := tagValue(input.TagSpecifications[0].Tags, "Name")
+				require.Contains(t, append([]string{"runner"}, additionalRunnerNames...), name)
+				assertLaunchCostTags(t, input, name, "pool", "controller", "linux", "")
+			}
+		}
+	})
 	m.On("DescribeImages", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeImagesOutput{
 		Images: []types.Image{{ImageId: aws.String("ami-12345678"), RootDeviceName: aws.String("/dev/sda1")}},
 	}, nil)

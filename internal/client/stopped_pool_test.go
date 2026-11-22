@@ -20,7 +20,11 @@ import (
 )
 
 func TestStoppedClaimConcurrentOneUse(t *testing.T) {
-	cli, m := newCapacityCli(t)
+	names := make([]string, 12)
+	for i := range names {
+		names[i] = fmt.Sprintf("runner-%d", i)
+	}
+	cli, m := newCapacityCli(t, names...)
 	m.ExpectedCalls[0].Maybe()
 	cli.cacheDir = t.TempDir()
 	s := capacitySpec(false)
